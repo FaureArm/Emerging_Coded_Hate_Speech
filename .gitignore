@@ -2,3 +2,4 @@ data/*
 venv
 *.md
 !README.md
+*__pycache__
