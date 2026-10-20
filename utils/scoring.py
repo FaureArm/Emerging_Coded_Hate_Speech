@@ -8,7 +8,7 @@ def compute_cosine_similarities(candidate_embeddings, anchor_embeddings):
     return cosine_similarities
 
 
-def compute_relevance_scores(cosine_similarities, candidate_metadata, anchor_metadata):
+def compute_relevance_scores(cosine_similarities, candidate_metadata, anchor_metadata, embedding_posts):
     # NB: since we dont have a corpus large enough to separate anchor occurrences
     # and candidate discovery, instead we exclude comparisons between anchors and
     # candidate that are from the same post, to avoid bias in cosine similarity
@@ -28,17 +28,23 @@ def compute_relevance_scores(cosine_similarities, candidate_metadata, anchor_met
 
     same_post = candidate_ids_column == anchor_ids_row
 
+    # also exclude copies of the same text stored under different post ids
+    candidate_texts = embedding_posts.loc[candidate_post_ids, "Text for BERT"].to_numpy()
+    anchor_texts = embedding_posts.loc[anchor_post_ids, "Text for BERT"].to_numpy()
+    same_text = candidate_texts.reshape(-1, 1) == anchor_texts.reshape(1, -1)
+    excluded_references = same_post | same_text
+
 
     # exclude similarities between embeddings from the same post
     eligible_similarities = cosine_similarities.copy()
-    eligible_similarities[same_post] = -np.inf
+    eligible_similarities[excluded_references] = -np.inf
 
 
     # check that every candidate has at least five eligible references
     # not very practical, could try to implement a func to avg over the
     # number of references (checkin if -np.inf and keeping this somewhere)
     # but not worth the hassle for now.
-    eligible_anchor_counts = len(anchor_post_ids) - same_post.sum(axis=1)
+    eligible_anchor_counts = len(anchor_post_ids) - excluded_references.sum(axis=1)
 
     if (eligible_anchor_counts < 5).any():
         raise ValueError(
