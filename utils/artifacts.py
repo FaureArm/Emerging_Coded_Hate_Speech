@@ -58,19 +58,23 @@ def load_artifacts(ART):
     data = pd.read_pickle(ART / "preprocessed_data.pkl")
 
     tfidf_candidates = pd.read_csv(
-        ART / "tfidf_candidates.csv"
+        ART / "tfidf_candidates.csv",
+        keep_default_na=False,
     )
 
     candidate_scores = pd.read_csv(
-        ART / "candidate_scores.csv"
+        ART / "candidate_scores.csv",
+        keep_default_na=False,
     )
 
     candidate_post_scores = pd.read_csv(
-        ART / "candidate_post_scores.csv"
+        ART / "candidate_post_scores.csv",
+        keep_default_na=False,
     )
 
     candidate_metadata = pd.read_csv(
-        ART / "candidate_metadata.csv"
+        ART / "candidate_metadata.csv",
+        keep_default_na=False,
     )
 
     anchor_metadata = pd.read_csv(
