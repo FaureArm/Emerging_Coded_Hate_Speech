@@ -3,3 +3,4 @@ venv
 *.md
 !README.md
 *__pycache__
+*.zip
