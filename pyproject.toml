@@ -3,6 +3,7 @@ name = "emerging-coded-hate-speech"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "datasets>=5.1.0",
     "emoji>=2.16.0",
     "ftfy>=6.3.1",
     "ipykernel>=7.4.0",
