@@ -24,7 +24,8 @@ def embed_anchor_occurrence(text, start, end):
         text, add_special_tokens=False, return_offsets_mapping=True, verbose=False
     )
     positions = [
-        i for i, (left, right) in enumerate(tokens["offset_mapping"])
+        i
+        for i, (left, right) in enumerate(tokens["offset_mapping"])
         if right > left and right > start and left < end
     ]
     if not positions:
@@ -38,7 +39,9 @@ def embed_anchor_occurrence(text, start, end):
     window_text = text[window_start:window_end]
 
     inputs = tokenizer(
-        window_text, return_tensors="pt", return_offsets_mapping=True,
+        window_text,
+        return_tensors="pt",
+        return_offsets_mapping=True,
         truncation=False,
     )
     offsets = inputs.pop("offset_mapping")[0]
@@ -68,13 +71,16 @@ def embed_anchors(anchor_occurrences, embedding_posts):
     # Each matrix row corresponds to the same row in this metadata table.
     anchor_occurrence_metadata = (
         anchor_occurrences.drop_duplicates(["post_id", "anchor", "start", "end"])
-        .reset_index(drop=True).copy()
+        .reset_index(drop=True)
+        .copy()
     )
     occurrence_vectors = []
     for occurrence in anchor_occurrence_metadata.itertuples(index=False):
         text = embedding_posts.loc[occurrence.post_id, "Text for BERT"]
-        if text[occurrence.start:occurrence.end] != occurrence.matched_text:
-            raise ValueError("Text changed after matching. Rerun anchor matching first.")
+        if text[occurrence.start : occurrence.end] != occurrence.matched_text:
+            raise ValueError(
+                "Text changed after matching. Rerun anchor matching first."
+            )
         occurrence_vectors.append(
             embed_anchor_occurrence(text, occurrence.start, occurrence.end)
         )
@@ -88,11 +94,13 @@ def embed_anchors(anchor_occurrences, embedding_posts):
         ["anchor", "post_id"], sort=False
     ):
         reference_vectors.append(anchor_occurrence_embeddings[group.index].mean(axis=0))
-        reference_records.append({
-            "anchor": anchor,
-            "post_id": post_id,
-            "n_occurrences": len(group),
-        })
+        reference_records.append(
+            {
+                "anchor": anchor,
+                "post_id": post_id,
+                "n_occurrences": len(group),
+            }
+        )
 
     anchor_embeddings = np.stack(reference_vectors)
     anchor_metadata = pd.DataFrame(reference_records)
@@ -132,10 +140,7 @@ def prepare_context_windows(post_text, post_occurrences):
             raise ValueError("Text changed. Rerun candidate occurrence matching.")
 
         # Find BERT tokens overlapping the candidate's original passage.
-        overlaps_candidate = (
-            (offsets[:, 1] > start)
-            & (offsets[:, 0] < end)
-        )
+        overlaps_candidate = (offsets[:, 1] > start) & (offsets[:, 0] < end)
         real_tokens = offsets[:, 1] > offsets[:, 0]
 
         token_indices = np.flatnonzero(overlaps_candidate & real_tokens)
@@ -183,9 +188,8 @@ def average_candidate_tokens(
         relative_start = word_start - window_start
         relative_end = word_end - window_start
 
-        overlaps_word = (
-            (token_offsets[:, 1] > relative_start)
-            & (token_offsets[:, 0] < relative_end)
+        overlaps_word = (token_offsets[:, 1] > relative_start) & (
+            token_offsets[:, 0] < relative_end
         )
 
         selected_tokens = selected_tokens | overlaps_word
@@ -208,7 +212,7 @@ def embed_window_batch(post_text, window_batch):
     passages = []
 
     for window in window_batch:
-        passages.append(post_text[window["start"]:window["end"]])
+        passages.append(post_text[window["start"] : window["end"]])
 
     inputs = tokenizer(
         passages,
@@ -258,7 +262,6 @@ def embed_candidates(candidate_occurrences, embedding_posts, candidate_batch_siz
         dtype=np.float32,
     )
 
-
     # 2. Calculate contextual vectors, processing each post's windows in batches.
     posts = candidate_occurrence_metadata.groupby("post_id", sort=False)
 
@@ -267,12 +270,11 @@ def embed_candidates(candidate_occurrences, embedding_posts, candidate_batch_siz
         windows = prepare_context_windows(post_text, post_occurrences)
 
         for batch_start in range(0, len(windows), candidate_batch_size):
-            window_batch = windows[batch_start:batch_start + candidate_batch_size]
+            window_batch = windows[batch_start : batch_start + candidate_batch_size]
             batch_vectors = embed_window_batch(post_text, window_batch)
 
             for occurrence_id, vector in batch_vectors.items():
                 candidate_occurrence_embeddings[occurrence_id] = vector
-
 
     # 3. Average repeated occurrences of the same candidate within each post.
     candidate_post_vectors = []
@@ -287,11 +289,13 @@ def embed_candidates(candidate_occurrences, embedding_posts, candidate_batch_siz
         vectors = candidate_occurrence_embeddings[occurrences_in_post.index]
 
         candidate_post_vectors.append(vectors.mean(axis=0))
-        candidate_post_records.append({
-            "candidate": candidate,
-            "post_id": post_id,
-            "n_occurrences": len(occurrences_in_post),
-        })
+        candidate_post_records.append(
+            {
+                "candidate": candidate,
+                "post_id": post_id,
+                "n_occurrences": len(occurrences_in_post),
+            }
+        )
 
     candidate_embeddings = np.stack(candidate_post_vectors)
     candidate_metadata = pd.DataFrame(candidate_post_records)
