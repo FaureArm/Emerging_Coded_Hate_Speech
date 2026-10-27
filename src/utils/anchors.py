@@ -8,28 +8,10 @@ import pandas as pd
 
 #TODO: keep in a csv or smth
 
-anchor_terms = {
-    "kike": ["kike"],
-    "blood libel": ["blood libel"],
-    "the goyim know": ["the goyim know"],
-    "great replacement": ["great replacement"],
-    "holocaust/gas chambers": ["holocaust", "gas chambers"],
-    "holohoax": ["holohoax"],
-    "jew coup": ["jew coup"],
-    "jew down": ["jew down"],
-    "jewish feature": ["jewish feature"],
-    "jewish figure": ["jewish figure"],
-    "jewish lighting": ["jewish lighting"],
-    "jewish power": ["jewish power"],
-    "kosher tax": ["kosher tax"],
-    "laughing jew": ["laughing jew"],
-    "nazi symbols": ["nazi symbols"],
-    "protocols of the elders of zion": ["protocols of the elders of zion"],
-    "qanon": ["qanon"],
-    "smirking merchant": ["smirking merchant"],
-    "zionism is racism": ["zionism is racism"],
-    "zionist occupied government": ["zionist occupied government"],
-}
+# Keep the existing runner import compatible with the shared vocabulary.
+from .vocabulary import anchor_terms_by_hate_category
+
+anchor_terms = anchor_terms_by_hate_category["antisemitism"]
 
 
 def find_anchor_occurrences(embedding_posts, anchor_terms):

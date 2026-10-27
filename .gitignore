@@ -1,4 +1,5 @@
 data/*
+artifacts/*
 venv
 *.md
 !README.md
