@@ -4,17 +4,6 @@ import emoji
 import nltk
 
 
-def configure_preprocessing(
-    stop_words_value,
-    sentence_tokenizer_value,
-    word_tokenizer_value,
-):
-    global stop_words, sentence_tokenizer, word_tokenizer
-    stop_words = stop_words_value
-    sentence_tokenizer = sentence_tokenizer_value
-    word_tokenizer = word_tokenizer_value
-
-
 # function to remove urls and emojis, etc
 
 def cleanup(text):
@@ -46,7 +35,7 @@ def cleanup(text):
 
 
 # function to tokenize while retaining position
-def tokenize_with_positions(text):
+def tokenize_with_positions(text, stop_words, sentence_tokenizer, word_tokenizer):
     """Tag complete sentences and retain word positions for BERT"""
     if not isinstance(text, str):
         return []
@@ -85,3 +74,23 @@ def tokenize_with_positions(text):
             })
 
     return word_records
+
+
+def load_nlp_tools():
+    """Load the baseline resources; downloads happen only during an explicit run."""
+    from nltk.corpus import stopwords
+    from nltk.tokenize import NLTKWordTokenizer, PunktTokenizer
+
+    for resource_path, package in (
+        ("corpora/stopwords", "stopwords"),
+        ("tokenizers/punkt_tab/english", "punkt_tab"),
+        ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+    ):
+        try:
+            nltk.data.find(resource_path)
+        except LookupError:
+            try:
+                nltk.download(package, quiet=True, raise_on_error=True)
+            except Exception as error:
+                raise RuntimeError(f"Missing NLTK resource {package}. Install it with python -m nltk.downloader {package}.") from error
+    return set(stopwords.words("english")), PunktTokenizer("english"), NLTKWordTokenizer()

@@ -1,370 +1,196 @@
-"""Run the calculations from Reproduce.ipynb and export their results.
-HOW TO RUN
-Meant to be run in a colab cli session
+"""One discovery experiment against a previously encoded Raiders reference bank.
 
-colab new -s reproduction --gpu T4
+From any working directory:
+    python /path/to/project/src/run_reproduction.py --max-posts 1000
 
-colab install -s reproduction pandas numpy nltk ftfy emoji torch transformers scikit-learn tqdm
-
-zip -r reproduction_inputs.zip utils \
-  "data/Unmasking Antisemitism SRI Data Set - Reporting Layer.csv" \
-  -x '*/__pycache__/*'
-
-colab upload -s reproduction reproduction_inputs.zip content/reproduction_inputs.zip
-
-echo 'import zipfile; zipfile.ZipFile("/content/reproduction_inputs.zip").extractall("/content")' | colab exec -s reproduction
-
-colab exec -s reproduction -f run_reproduction.py --timeout 7200
-
-Once finished running, download the artifacts with:
-colab download -s reproduction content/artifacts.zip .artifacts/artifacts_colab.zip
-
+See README.md for the occasional reference setup and Colab CLI commands.
+This script never builds reference vectors from discovery posts.
 """
 
-from pathlib import Path
-
-DATA_SOURCE = Path("data/raiders/raiders_antisemitism.csv")
-ARTIFACTS_DIR = Path("/content/artifacts_raiders")
-
-checkpoint = "google-bert/bert-base-uncased"  # could try different models, for ex cased
-context_tokens = 64
-candidate_batch_size = 16
-
-
-import json
-import shutil
+import argparse
 from datetime import datetime, timezone
 from importlib.metadata import version
+from pathlib import Path
+import random
+import subprocess
 from time import perf_counter
 
-import ftfy
-import nltk
-import numpy as np
-import pandas as pd
-import torch
-from nltk.corpus import stopwords
-from nltk.tokenize import NLTKWordTokenizer, PunktTokenizer
-from transformers import AutoModel, AutoTokenizer
 
-from utils.anchors import anchor_terms, find_anchor_occurrences
-from utils.artifacts import save_artifacts
-from utils.candidates import (
-    apply_pos_filter,
-    build_ngrams,
-    build_pos_ngrams,
-    extract_tfidf_candidates,
-    find_candidate_occurrences,
-)
-from utils.embeddings import configure_embeddings, embed_anchors, embed_candidates
-from utils.preprocessing import (
-    cleanup,
-    configure_preprocessing,
-    tokenize_with_positions,
-)
-from utils.scoring import (
-    aggregate_candidate_counts,
-    aggregate_candidate_scores,
-    compute_cosine_similarities,
-    compute_relevance_scores,
-    filter_by_occurrences,
-    filter_by_relevance,
-    rank_candidates,
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def main():
-    started_at = datetime.now(timezone.utc).isoformat()
-    start_time = perf_counter()
-    ART = ARTIFACTS_DIR.resolve()
+def project_path(value):
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
 
-    if not DATA_SOURCE.is_file():
-        raise FileNotFoundError(
-            f"Dataset not found: {DATA_SOURCE.resolve()}. "
-            "Set DATA_SOURCE to a CSV available on the machine running this script."
-        )
 
-    print(f"Data source: {DATA_SOURCE.resolve()}", flush=True)
-    print(f"Artifacts folder: {ART}", flush=True)
+def parse_arguments(arguments=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=project_path, default=PROJECT_ROOT / "data/raiders/raiders_first_1GB.ndjson")
+    parser.add_argument("--reference-bank", type=project_path, default=PROJECT_ROOT / "artifacts/reference_banks/antisemitism_v1")
+    parser.add_argument("--output", type=project_path, default=PROJECT_ROOT / "artifacts" /
+                        datetime.now(timezone.utc).strftime("raiders_antisemitism_%Y%m%dT%H%M%S_%fZ"))
+    parser.add_argument("--max-posts", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=16, help="Candidate BERT window batch size")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    return parser.parse_args(arguments)
 
-    # load the data
-    df = pd.read_csv(DATA_SOURCE, keep_default_na=False)
 
-    if "Post Text" not in df.columns:
-        raise ValueError("The input CSV must contain a 'Post Text' column.")
+def enrich_candidate_metadata(metadata, posts):
+    source_columns = ["post_id", "post_key", "thread_id", "thread_key", "board", "normalized_text_sha256"]
+    enriched = metadata.merge(posts.reset_index(drop=True)[source_columns], on="post_id",
+                              how="left", sort=False, validate="many_to_one")
+    if len(enriched) != len(metadata) or enriched["post_key"].isna().any():
+        raise ValueError("Candidate metadata lost its source identity.")
+    if enriched["post_id"].tolist() != metadata["post_id"].tolist():
+        raise ValueError("Source metadata join changed embedding row order.")
+    return enriched
 
-    data = df.dropna(subset=["Post Text"]).copy()
-    if data.empty:
-        raise ValueError("The input CSV contains no non-missing post texts.")
 
-    ART.mkdir(parents=True, exist_ok=True)
-    print(f"Posts with text: {len(data)} / {len(df)}", flush=True)
-    print("1/6: Preprocessing and POS tagging", flush=True)
+def code_identity():
+    from utils.reference_review import file_sha256
 
-    # Download the missing NLTK stopwords and punkt_tab resources
-    nltk.download("stopwords")
-    nltk.download("punkt_tab")
-
-    stop_words = set(stopwords.words("english"))
-    sentence_tokenizer = PunktTokenizer("english")
-    word_tokenizer = NLTKWordTokenizer()
-
-    # Preserve readable sentences for BERT
-    data["Text for BERT"] = data["Post Text"].apply(
-        lambda text: ftfy.fix_encoding(text) if isinstance(text, str) else text
-    )
-
-    # POS tagging happens during initial tokenization
-    nltk.download("averaged_perceptron_tagger_eng")
-
-    configure_preprocessing(stop_words, sentence_tokenizer, word_tokenizer)
-
-    # split into two new cols the different types of data
-
-    # text as is required for BERT
-    # aka just cleaned
-    data["Text for Candidate Extraction"] = data["Text for BERT"].apply(cleanup)
-
-    # text as is required for TFIDF
-    # list of words, with position, stop-words applied, etc
-    data["Word Tokens"] = data["Text for Candidate Extraction"].apply(
-        tokenize_with_positions
-    )
-
-    print("2/6: Candidate generation and TF-IDF", flush=True)
-    data = build_ngrams(data)
-
-    # Tag the existing unigram, bigram, and trigram candidates
-    nltk.download("averaged_perceptron_tagger_eng")
-
-    data = build_pos_ngrams(data)
-
-    # Each tagged candidate contains (word, POS tag) pairs
-    data = apply_pos_filter(data)
-
-    (
-        documents,
-        vectorizer,
-        tfidf,
-        terms,
-        max_scores,
-        delta,
-        selected_terms,
-    ) = extract_tfidf_candidates(data)
-
-    print(f"{len(selected_terms)} selected terms", flush=True)
-    print("3/6: Anchor matching and contextual embeddings", flush=True)
-
-    ### Contextual embedding ###
-    # https://github.com/UKPLab/sentence-transformers ??
-    ## Anchor terms ##
-
-    # retrieve the entire post text before our preprocessing
-    # so that we apply the BERT preprocessing to the entire text isntead
-    embedding_posts = data[["Post Text", "Text for BERT"]].copy()
-
-    embedding_posts["Text for BERT"] = embedding_posts["Post Text"].apply(
-        lambda text: ftfy.fix_encoding(text) if isinstance(text, str) else text
-    )
-
-    occurrences, anchor_occurrences = find_anchor_occurrences(
-        embedding_posts, anchor_terms
-    )
-
-    # applying BERT context to anchor words
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if anchor_occurrences.empty:
-        raise ValueError("No anchor occurrences found. Check the matching cell first.")
-
-    print(f"Device: {device}", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint, use_fast=True)
-    model = AutoModel.from_pretrained(checkpoint).to(device)
-    model.eval()  # Disable training behavior such as dropout.
-
-    configure_embeddings(model, tokenizer, device, context_tokens)
-
-    (
-        anchor_occurrence_metadata,
-        occurrence_vectors,
-        anchor_occurrence_embeddings,
-        reference_vectors,
-        reference_records,
-        anchor_embeddings,
-        anchor_metadata,
-        anchor_reference_post_ids,
-    ) = embed_anchors(anchor_occurrences, embedding_posts)
-
-    print(f"Anchor/post embeddings: {anchor_embeddings.shape}", flush=True)
-    print(
-        "Anchors without matches:",
-        sorted(set(anchor_terms) - set(anchor_metadata["anchor"])),
-    )
-
-    # to visualise which anchors dominate the reference database
-    anchor_coverage = (
-        anchor_metadata.groupby("anchor")
-        .agg(
-            n_vectors=("post_id", "size"),
-            n_posts=("post_id", "nunique"),
-        )
-        .reindex(anchor_terms.keys(), fill_value=0)
-        .sort_values("n_vectors", ascending=False)
-    )
-
-    print("4/6: Candidate matching and contextual embeddings", flush=True)
-    (
-        candidate_terms,
-        candidate_records,
-        ngram_columns,
-        candidate_occurrences,
-        matched_candidates,
-        unmatched_candidates,
-    ) = find_candidate_occurrences(data, selected_terms)
-
-    configure_embeddings(model, tokenizer, device, context_tokens)
-    model.eval()
-
-    (
-        candidate_occurrence_metadata,
-        candidate_occurrence_embeddings,
-        candidate_post_vectors,
-        candidate_post_records,
-        candidate_embeddings,
-        candidate_metadata,
-    ) = embed_candidates(candidate_occurrences, embedding_posts, candidate_batch_size)
-
-    print(f"Candidate/post embeddings: {candidate_embeddings.shape}", flush=True)
-    print("Candidates without matches:", unmatched_candidates)
-    print("5/6: Cosine similarities, relevance scores and filtering", flush=True)
-
-    cosine_similarities = compute_cosine_similarities(
-        candidate_embeddings, anchor_embeddings
-    )
-
-    (
-        candidate_post_ids,
-        anchor_post_ids,
-        candidate_ids_column,
-        anchor_ids_row,
-        same_post,
-        eligible_similarities,
-        eligible_anchor_counts,
-        sorted_similarities,
-        top_five_similarities,
-        relevance_scores,
-        candidate_post_scores,
-    ) = compute_relevance_scores(
-        cosine_similarities, candidate_metadata, anchor_metadata, embedding_posts
-    )
-
-    candidate_scores = aggregate_candidate_scores(candidate_post_scores)
-    ranked_candidates = rank_candidates(candidate_scores)
-    relevance_threshold, filtered_candidates = filter_by_relevance(
-        candidate_scores, ranked_candidates
-    )
-    filtered_candidates_relevance = filtered_candidates
-
-    save_artifacts(
-        ART,
-        data,
-        terms,
-        max_scores,
-        delta,
-        candidate_post_scores,
-        candidate_scores,
-        candidate_embeddings,
-        candidate_metadata,
-        anchor_embeddings,
-        anchor_metadata,
-    )
-    ranked_candidates.to_csv(ART / "ranked_candidates.csv", index=False)
-    filtered_candidates_relevance.to_csv(
-        ART / "filtered_candidates_relevance.csv", index=False
-    )
-
-    candidate_scores = aggregate_candidate_counts(candidate_post_scores)
-    ranked_candidates = rank_candidates(candidate_scores)
-
-    (
-        relevance_threshold,
-        median_occurrences,
-        occurrence_threshold,
-        filtered_candidates,
-    ) = filter_by_occurrences(candidate_scores, ranked_candidates)
-    filtered_candidates_frequency = filtered_candidates
-
-    print(
-        "6/6: Exporting additional results and creating the download archive",
-        flush=True,
-    )
-
-    candidate_scores.to_csv(ART / "candidate_scores_with_counts.csv", index=False)
-    ranked_candidates.to_csv(ART / "ranked_candidates_with_counts.csv", index=False)
-    filtered_candidates_frequency.to_csv(
-        ART / "filtered_candidates_frequency.csv", index=False
-    )
-    anchor_coverage.to_csv(ART / "anchor_coverage.csv", index_label="anchor")
-
-    anchor_occurrence_metadata.to_pickle(ART / "anchor_occurrence_metadata.pkl")
-    candidate_occurrence_metadata.to_pickle(ART / "candidate_occurrence_metadata.pkl")
-    np.save(ART / "anchor_occurrence_embeddings.npy", anchor_occurrence_embeddings)
-    np.save(
-        ART / "candidate_occurrence_embeddings.npy", candidate_occurrence_embeddings
-    )
-    np.save(ART / "cosine_similarities.npy", cosine_similarities)
-    np.save(ART / "eligible_similarities.npy", eligible_similarities)
-    np.save(ART / "eligible_anchor_counts.npy", eligible_anchor_counts)
-    np.save(ART / "top_five_similarities.npy", top_five_similarities)
-
-    run_info = {
-        "started_at": started_at,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-        "calculation_and_export_seconds": perf_counter() - start_time,
-        "data_source": str(DATA_SOURCE.resolve()),
-        "artifacts_dir": str(ART),
-        "checkpoint": checkpoint,
-        "context_tokens": context_tokens,
-        "candidate_batch_size": candidate_batch_size,
-        "device": str(device),
-        "input_rows": len(df),
-        "posts_used": len(data),
-        "selected_terms": len(selected_terms),
-        "unmatched_candidates": unmatched_candidates,
-        "anchor_terms": anchor_terms,
-        "anchor_post_embeddings": len(anchor_metadata),
-        "candidate_post_embeddings": len(candidate_metadata),
-        "tfidf_threshold": float(delta),
-        "relevance_threshold": float(relevance_threshold),
-        "median_occurrences": float(median_occurrences),
-        "minimum_occurrences": int(occurrence_threshold),
-        "exclude_same_post": True,
-        "exclude_identical_text": True,
-        "package_versions": {
-            package: version(package)
-            for package in (
-                "emoji",
-                "ftfy",
-                "nltk",
-                "numpy",
-                "pandas",
-                "scikit-learn",
-                "torch",
-                "transformers",
-                "tqdm",
-            )
+    def git_output(*arguments):
+        try:
+            result = subprocess.run(["git", "-C", str(PROJECT_ROOT), *arguments], capture_output=True, text=True)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except FileNotFoundError:
+            return None
+    return {
+        "git_commit": git_output("rev-parse", "HEAD"),
+        "git_status": git_output("status", "--short"),
+        "source_files_sha256": {
+            str(path.relative_to(PROJECT_ROOT)): file_sha256(path)
+            for path in sorted((PROJECT_ROOT / "src").rglob("*.py"))
         },
     }
-    (ART / "run_info.json").write_text(
-        json.dumps(run_info, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
 
-    archive_path = shutil.make_archive(
-        str(ART), "zip", root_dir=ART.parent, base_dir=ART.name
+
+def run_experiment(arguments):
+    import numpy as np
+    import pandas as pd
+    from utils.artifacts import save_discovery_run
+    from utils.candidates import prepare_candidates
+    from utils.discovery import retrieve_discovery_posts
+    from utils.preprocessing import load_nlp_tools
+    from utils.reference_bank import load_reference_bank, validate_discovery_bank
+    from utils.reference_review import file_sha256
+    from utils.scoring import score_fixed_reference_bank, summarize_rankings
+    from utils.vocabulary import anchor_terms_by_hate_category, seed_words_by_hate_category
+
+    if arguments.max_posts < 1 or arguments.batch_size < 1:
+        raise ValueError("--max-posts and --batch-size must be positive.")
+    if arguments.output.exists():
+        raise FileExistsError(f"Run directory already exists: {arguments.output}. Choose a new --output.")
+    if not (arguments.reference_bank / "bank_manifest.json").is_file():
+        raise FileNotFoundError(
+            f"No encoded reference bank at {arguments.reference_bank}. "
+            "Build it once with src/build_reference_bank.py on Colab, or set --reference-bank. "
+            "Discovery will not generate replacement reference vectors."
+        )
+    started_at = datetime.now(timezone.utc).isoformat()
+    experiment_started = perf_counter()
+    stage_times = {}
+    random_seed = 42
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    anchors = anchor_terms_by_hate_category["antisemitism"]
+    seed_words = list(seed_words_by_hate_category["antisemitism"])
+
+    print("1/5: Validating the fixed reference bank", flush=True)
+    stage_started = perf_counter()
+    reference_vectors, reference_metadata, reference_posts, bank_manifest = load_reference_bank(arguments.reference_bank)
+    reference_metadata = validate_discovery_bank(reference_vectors, reference_metadata, reference_posts, bank_manifest, anchors)
+    bank_identifier = file_sha256(arguments.reference_bank / "bank_manifest.json")
+    reference_coverage = pd.read_csv(arguments.reference_bank / "anchor_coverage.csv", keep_default_na=False)
+    stage_times["reference_loading"] = perf_counter() - stage_started
+
+    print("2/5: Retrieving independent discovery posts", flush=True)
+    stage_started = perf_counter()
+    posts, seed_summary, retrieval_info = retrieve_discovery_posts(
+        arguments.input, seed_words, reference_posts, arguments.max_posts
     )
-    print(f"Artifacts folder: {ART}", flush=True)
-    print(f"Download archive: {archive_path}", flush=True)
-    print(f"Finished in {perf_counter() - start_time:.1f} seconds.", flush=True)
+    stage_times["retrieval"] = perf_counter() - stage_started
+    print(f"Retrieved {len(posts):,} posts in {posts.thread_id.nunique():,} threads.", flush=True)
+
+    print("3/5: Existing lexical/POS/TF-IDF candidate extraction", flush=True)
+    stage_started = perf_counter()
+    stop_words, sentence_tokenizer, word_tokenizer = load_nlp_tools()
+    occurrences, tfidf_candidates, stage_counts = prepare_candidates(posts, stop_words, sentence_tokenizer, word_tokenizer)
+    stage_times["candidate_preparation"] = perf_counter() - stage_started
+
+    print("4/5: Contextual candidate embeddings", flush=True)
+    from utils.embeddings import EMBEDDING_PROCEDURE, embed_candidates, load_embedding_model
+    import torch
+
+    torch.manual_seed(random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(random_seed)
+    # No training, and no reduced-precision matrix multiplication in this baseline.
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    stage_started = perf_counter()
+    embedding_configuration = bank_manifest["embedding_config"]
+    model, tokenizer, device = load_embedding_model(embedding_configuration, arguments.device)
+    stage_times["model_loading"] = perf_counter() - stage_started
+    stage_started = perf_counter()
+    (
+        occurrence_metadata, _, _, _, candidate_vectors, candidate_metadata,
+    ) = embed_candidates(
+        occurrences, posts.rename(columns={"text": "Text for BERT"}), arguments.batch_size,
+        model, tokenizer, device, embedding_configuration["context_tokens_each_side"],
+    )
+    occurrence_metadata = enrich_candidate_metadata(occurrence_metadata, posts)
+    candidate_metadata = enrich_candidate_metadata(candidate_metadata, posts)
+    candidate_metadata.insert(0, "embedding_row", np.arange(len(candidate_metadata)))
+    stage_times["candidate_embedding"] = perf_counter() - stage_started
+
+    print("5/5: Top-five reference scoring and export", flush=True)
+    stage_started = perf_counter()
+    candidate_post_scores = score_fixed_reference_bank(candidate_vectors, candidate_metadata, reference_vectors, reference_metadata)
+    rankings, relevance_threshold = summarize_rankings(candidate_post_scores, occurrence_metadata)
+    stage_times["scoring"] = perf_counter() - stage_started
+    stage_counts["candidate_post_embeddings"] = len(candidate_metadata)
+    stage_counts["ranked_candidates"] = len(rankings)
+    stage_counts["relevance_survivors"] = int(rankings["passes_relevance"].sum())
+    run_info = {
+        "format_version": 1, "status": "complete", "started_at_utc": started_at,
+        "category": "antisemitism", "seed_words": seed_words, "anchor_terms": anchors,
+        "seed_provenance": "User's experimental broad seeds, not Wu's published seed selection",
+        "requested_max_posts": arguments.max_posts, "retrieval": retrieval_info,
+        "reference_bank": {"path": str(arguments.reference_bank), "identifier_sha256": bank_identifier,
+                           "manifest": bank_manifest},
+        "embedding_config": embedding_configuration, "candidate_embedding_procedure": EMBEDDING_PROCEDURE,
+        "candidate_batch_size": arguments.batch_size, "device": str(device), "random_seed": random_seed,
+        "tfidf_threshold": stage_counts["tfidf_threshold"], "relevance_threshold": relevance_threshold,
+        "nearest_reference_vectors": 5, "ngram_policy": stage_counts["ngram_policy"],
+        "frequency_filter_applied": False, "stage_seconds": stage_times,
+        "calculation_seconds": perf_counter() - experiment_started,
+        "finished_calculation_at_utc": datetime.now(timezone.utc).isoformat(),
+        "tf32": False, "determinism": "eval mode and fixed seeds; cross-device bitwise equality is not guaranteed",
+        "software": {"packages": {package: version(package) for package in
+                      ("numpy", "pandas", "torch", "transformers", "tokenizers", "nltk", "scikit-learn", "emoji")},
+                     **code_identity()},
+        "limitations": [
+            "Consecutive historical source slice; retrieval is seed-conditioned and stops in file order",
+            "Reference anchor matches are assumed suitable contexts, not validated hate labels",
+            "Thread holdout is defined by this bank's selected source threads, not its entire sampling pool",
+            "Normalized full-text equality excludes copies, not shared passages or paraphrases",
+            "Legacy stopword-before-ngram extraction retained; noncontiguous occurrences are flagged",
+            "Existing noun/adjective POS rules are provisional, not verified exact Wu rules",
+            "Reference preparation selects one occurrence per anchor/thread and caps contexts; candidate repeats are averaged",
+            "Distinct posts/threads do not establish independent adoption; similarity is not a hate label",
+        ],
+    }
+    save_discovery_run(arguments.output, run_info, posts, seed_summary, reference_coverage,
+                       stage_counts, tfidf_candidates, occurrence_metadata, candidate_vectors,
+                       candidate_metadata, candidate_post_scores, rankings)
+    print(f"Completed run: {arguments.output}", flush=True)
+    return arguments.output
+
+
+def main(arguments=None):
+    return run_experiment(parse_arguments(arguments))
 
 
 if __name__ == "__main__":

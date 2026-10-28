@@ -194,6 +194,11 @@ def find_candidate_occurrences(data, selected_terms):
                     "start": start,
                     "end": end,
                     "word_spans": tuple(word_spans),
+                    # Keep the baseline n-grams, but expose words removed between them.
+                    "is_contiguous": all(
+                        not text[left_end:right_start].strip()
+                        for (_, left_end), (right_start, _) in zip(word_spans, word_spans[1:])
+                    ),
                 })
 
     candidate_occurrences = pd.DataFrame(
@@ -205,6 +210,7 @@ def find_candidate_occurrences(data, selected_terms):
             "start",
             "end",
             "word_spans",
+            "is_contiguous",
         ],
     )
 
@@ -219,3 +225,44 @@ def find_candidate_occurrences(data, selected_terms):
         matched_candidates,
         unmatched_candidates,
     )
+
+
+def prepare_candidates(posts, stop_words, sentence_tokenizer, word_tokenizer):
+    """Run the existing lexical/POS/TF-IDF baseline and keep its audit counts."""
+    from .preprocessing import cleanup, tokenize_with_positions
+
+    data = posts.copy()
+    data["Text for BERT"] = data["text"]
+    data["Text for Candidate Extraction"] = data["text"].map(cleanup)
+    data["Word Tokens"] = data["Text for Candidate Extraction"].map(
+        lambda text: tokenize_with_positions(text, stop_words, sentence_tokenizer, word_tokenizer)
+    )
+    data = build_pos_ngrams(build_ngrams(data))
+    data = apply_pos_filter(data)
+    stage_counts = {"ngram_policy": "legacy_stopwords_before_ngrams", "ngrams": {}}
+    for size, column in [(1, "Unigrams"), (2, "Bigrams"), (3, "Trigrams")]:
+        original = [gram for grams in data[column] for gram in grams]
+        kept = [gram for grams in data[f"{column} Filtered"] for gram in grams]
+        stage_counts["ngrams"][str(size)] = {
+            "before_pos_occurrences": len(original), "after_pos_occurrences": len(kept),
+            "before_pos_unique": len(set(original)), "after_pos_unique": len(set(kept)),
+            "removed_examples": [gram if isinstance(gram, str) else " ".join(gram)
+                                 for gram in sorted(set(original) - set(kept))[:10]],
+        }
+    if not any(counts["after_pos_occurrences"] for counts in stage_counts["ngrams"].values()):
+        raise ValueError("No candidates survived POS filtering; try a larger discovery sample.")
+    _, _, _, terms, max_scores, threshold, selected_terms = extract_tfidf_candidates(data)
+    _, _, _, occurrences, matched_terms, unmatched_terms = find_candidate_occurrences(data, selected_terms)
+    if occurrences.empty:
+        raise ValueError("No candidate occurrences survived TF-IDF and occurrence matching.")
+    stage_counts.update(
+        tfidf_vocabulary=len(terms), tfidf_selected=len(selected_terms), tfidf_threshold=float(threshold),
+        matched_candidates=len(matched_terms), unmatched_candidates=unmatched_terms,
+        candidate_occurrences=len(occurrences),
+        noncontiguous_occurrences=int((~occurrences["is_contiguous"]).sum()),
+    )
+    tfidf_table = pd.DataFrame({
+        "candidate": terms, "max_tfidf": max_scores, "selected": max_scores > threshold,
+        "ngram_length": [len(term.split()) for term in terms],
+    })
+    return occurrences, tfidf_table, stage_counts

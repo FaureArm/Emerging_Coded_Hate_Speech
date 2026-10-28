@@ -290,3 +290,50 @@ def load_reference_bank(bank_dir, expected_embedding_config=None):
     if not set(metadata["post_id"]).issubset(posts["post_id"]):
         raise ValueError("Reference source posts are missing.")
     return vectors, metadata, posts, manifest
+
+
+def validate_discovery_bank(vectors, metadata, posts, manifest, anchors):
+    """Check the saved bank's identity and the embedding procedure before discovery."""
+    from .discovery import parser_hash, validate_reference_posts
+
+    validate_reference_posts(posts)
+    if manifest.get("category") != "antisemitism" or manifest["preparation_config"]["anchors"] != anchors:
+        raise ValueError("Expected the unchanged antisemitism anchor vocabulary in the reference bank.")
+    if manifest["preparation_config"].get("parser_sha256") != parser_hash():
+        raise ValueError("Reference/discovery HTML parser versions differ; do not reclean the frozen bank.")
+    configuration = manifest["embedding_config"]
+    expected_settings = {
+        "layer": "last_hidden_state",
+        "pooling": "mean of subword tokens overlapping the selected anchor span; special tokens excluded",
+        "aggregation": "mean of selected occurrence vectors per (anchor, post_id)",
+        "text_transform": "none; exact saved reference text", "model_eval": True,
+        "model_dtype": "torch.float32",
+    }
+    for name, expected in expected_settings.items():
+        if configuration.get(name) != expected:
+            raise ValueError(f"Unsupported reference embedding setting {name}: {configuration.get(name)!r}")
+    # The argument-only refactor preserves this earlier helper's numerical procedure.
+    legacy_helper_hash = "b6a5064c62e23a9f3ff35ab59e084bef50a9da738ecfaf6027ff79291c865767"
+    if configuration.get("procedure") != "target-subword-mean-v1" and not (
+        "procedure" not in configuration and configuration.get("embedding_helper_sha256") == legacy_helper_hash
+    ):
+        raise ValueError("Unknown reference embedding procedure; verify compatibility before using this bank.")
+    if (not configuration.get("resolved_revision")
+            or configuration.get("tokenizer_revision") != configuration["resolved_revision"]
+            or configuration.get("tokenizer_checkpoint") != configuration.get("checkpoint")):
+        raise ValueError("Reference model/tokenizer must share a recorded checkpoint and resolved revision.")
+    if type(configuration.get("context_tokens_each_side")) is not int or configuration["context_tokens_each_side"] < 0:
+        raise ValueError("Reference context size is missing or invalid.")
+    if vectors.shape[1] != configuration.get("hidden_size") or len(vectors) < 5:
+        raise ValueError("Reference bank needs at least five vectors with the recorded model dimension.")
+    if metadata.duplicated(["anchor", "post_id"]).any() or not set(metadata["anchor"]).issubset(anchors):
+        raise ValueError("Reference anchor/post pairs are duplicated or outside the vocabulary.")
+    source_lookup = posts.set_index("post_id")
+    for column in ("thread_id", "board", "normalized_text_sha256"):
+        expected = metadata["post_id"].map(source_lookup[column])
+        if not expected.equals(metadata[column]):
+            raise ValueError(f"Reference vector metadata disagrees with source posts: {column}")
+    metadata = metadata.copy()
+    metadata["post_key"] = "4chan:pol:" + metadata["post_id"].astype(str)
+    metadata["thread_key"] = "4chan:pol:" + metadata["thread_id"].astype(str)
+    return metadata

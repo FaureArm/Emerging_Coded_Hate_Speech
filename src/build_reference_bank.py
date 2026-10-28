@@ -17,7 +17,7 @@ folder below and the parameters together if using a different prepared corpus):
     colab download -s references content/artifacts/reference_banks/antisemitism_v1.zip artifacts/reference_bank_antisemitism_v1.zip
 
 Only the prepared corpus and helpers are uploaded, not the 1 GB reference source.
-The existing discovery runner is not yet connected to this bank.
+The discovery runner consumes this saved bank; encoding is an occasional setup step.
 """
 
 from pathlib import Path
@@ -82,7 +82,6 @@ def main():
         raise ValueError("A fast tokenizer with character offsets is required.")
     model = AutoModel.from_pretrained(CHECKPOINT, revision=resolved_revision).to(device)
     model.eval()
-    embeddings.configure_embeddings(model, tokenizer, device, CONTEXT_TOKENS)
 
     # Original Raiders post IDs, not fresh DataFrame row numbers.
     embedding_posts = posts.set_index("post_id")[["text"]].rename(columns={"text": "Text for BERT"})
@@ -90,9 +89,10 @@ def main():
     (
         occurrence_metadata, _, occurrence_vectors, _, _,
         reference_vectors, reference_metadata, _,
-    ) = embeddings.embed_anchors(occurrences, embedding_posts)
+    ) = embeddings.embed_anchors(occurrences, embedding_posts, model, tokenizer, device, CONTEXT_TOKENS)
 
     embedding_config = {
+        "procedure": embeddings.EMBEDDING_PROCEDURE,
         "checkpoint": CHECKPOINT,
         "requested_revision": MODEL_REVISION,
         "resolved_revision": resolved_revision,
