@@ -47,7 +47,7 @@ def load_reference_corpus(corpus_dir):
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     if manifest["config"].get("format_version") != 2:
         raise ValueError(
-            "Expected an automatic reference corpus from Prepare_Reference.ipynb."
+            "Expected an automatic reference corpus prepared by run_pipeline.py."
         )
     checksums = manifest["file_checksums"]
     if set(checksums) != set(CORPUS_FILES):
@@ -292,13 +292,18 @@ def load_reference_bank(bank_dir, expected_embedding_config=None):
     return vectors, metadata, posts, manifest
 
 
-def validate_discovery_bank(vectors, metadata, posts, manifest, anchors):
+def validate_discovery_bank(vectors, metadata, posts, manifest, anchors, *, category):
     """Check the saved bank's identity and the embedding procedure before discovery."""
     from .discovery import parser_hash, validate_reference_posts
 
     validate_reference_posts(posts)
-    if manifest.get("category") != "antisemitism" or manifest["preparation_config"]["anchors"] != anchors:
-        raise ValueError("Expected the unchanged antisemitism anchor vocabulary in the reference bank.")
+    if manifest.get("category") != category or manifest["preparation_config"].get("category") != category:
+        raise ValueError(
+            f"Reference bank category mismatch: expected {category!r}, found {manifest.get('category')!r}. "
+            "Build a bank for the selected category using a new REFERENCE_VERSION."
+        )
+    if manifest["preparation_config"]["anchors"] != anchors:
+        raise ValueError(f"Reference bank does not match the {category!r} anchor vocabulary in vocabulary.py.")
     if manifest["preparation_config"].get("parser_sha256") != parser_hash():
         raise ValueError("Reference/discovery HTML parser versions differ; do not reclean the frozen bank.")
     configuration = manifest["embedding_config"]

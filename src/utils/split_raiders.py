@@ -1,40 +1,25 @@
-"""Create consecutive reference/discovery NDJSON slices without unpacking Raiders.
+"""Streaming consecutive reference/discovery slices, configured in run_pipeline.py.
 
-Run with Python 3.14+: .venv/bin/python src/utils/split_raiders.py
-Sizes are decimal GB and are maximums: records are never cut to meet a size.
-An existing reference file is reused only if it exactly matches the requested
-archive prefix. Discovery starts with the very next complete thread.
-This separates source records, not duplicate text or cross-thread quotations.
+Requires Python 3.14+ for standard-library Zstandard support. Sizes are maximum
+uncompressed decimal GB; whole thread records are preserved. Existing reference
+prefixes are verified against the archive; completed slice pairs reuse checksums.
 """
 
 from pathlib import Path
-
-# -------------------------- Editable parameters --------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ARCHIVE_PATH = PROJECT_ROOT / "data/raiders/pol_0616-1119_labeled.tar.zst"
-ARCHIVE_MEMBER = "pol_062016-112019_labeled.ndjson"
-
-REFERENCE_SIZE_GB = 1.0
-REFERENCE_PATH = PROJECT_ROOT / "data/raiders/raiders_first_1GB.ndjson"
-REUSE_EXISTING_REFERENCE = True
-
-DISCOVERY_SIZE_GB = 3.0
-DISCOVERY_PATH = PROJECT_ROOT / "data/raiders/raiders_next_3GB.ndjson"
-MANIFEST_PATH = PROJECT_ROOT / "data/raiders/raiders_split.info.json"
-PROGRESS_EVERY_THREADS = 10000
-# -------------------------------------------------------------------------
-
 from contextlib import ExitStack
 from datetime import datetime, timezone
-from decimal import Decimal
-from hashlib import sha256
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256, file_digest
 import json
 import tarfile
 
 
 def byte_limit(size_gb):
     """Convert a positive decimal-GB budget to bytes."""
-    value = Decimal(str(size_gb))
+    try:
+        value = Decimal(str(size_gb))
+    except InvalidOperation as error:
+        raise ValueError("Corpus sizes must be positive, finite numbers.") from error
     if not value.is_finite() or value <= 0:
         raise ValueError("Corpus sizes must be positive, finite numbers.")
     limit = int(value * 1_000_000_000)
@@ -43,7 +28,7 @@ def byte_limit(size_gb):
     return limit
 
 
-def copy_slice(source, pending, limit, output, existing=None):
+def copy_slice(source, pending, limit, output, existing=None, progress_every_threads=10000):
     """Consume a prefix under the budget, returning its first excluded line.
 
     When existing is supplied, compare bytes instead of writing. Keeping the
@@ -86,7 +71,7 @@ def copy_slice(source, pending, limit, output, existing=None):
         if stats["first_thread_id"] is None:
             stats["first_thread_id"] = thread_id
         stats["last_thread_id"] = thread_id
-        if PROGRESS_EVERY_THREADS and stats["threads"] % PROGRESS_EVERY_THREADS == 0:
+        if progress_every_threads and stats["threads"] % progress_every_threads == 0:
             print(
                 f"  {stats['threads']:,} threads / {stats['bytes'] / 1e9:.3f} GB",
                 flush=True,
@@ -108,96 +93,116 @@ def copy_slice(source, pending, limit, output, existing=None):
     return stats, line
 
 
-def main():
-    # Python 3.14's standard library provides streaming Zstandard support.
-    from compression import zstd
+def slice_configuration(archive_path, archive_member, reference_path, discovery_path,
+                        reference_size_gb, discovery_size_gb):
+    """Validate the requested layout without extracting or creating files."""
+    archive_path = Path(archive_path).resolve()
+    reference_path, discovery_path = Path(reference_path).resolve(), Path(discovery_path).resolve()
+    manifest_path = discovery_path.with_suffix(".slices.json")
+    paths = [archive_path, reference_path, discovery_path, manifest_path,
+             reference_path.with_name(reference_path.name + ".partial"),
+             discovery_path.with_name(discovery_path.name + ".partial")]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Automatic slices need distinct reference and discovery paths; choose a new DISCOVERY_SOURCE.")
+    if reference_path.suffix != ".ndjson" or discovery_path.suffix != ".ndjson":
+        raise ValueError("Both slice output paths must end in .ndjson.")
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Raiders archive not found: {archive_path}")
+    if not isinstance(archive_member, str) or not archive_member.strip():
+        raise ValueError("The NDJSON archive member name must be nonempty.")
+    archive_stat = archive_path.stat()
+    return {
+        "format_version": 1,
+        "source_archive": str(archive_path), "source_member": archive_member,
+        "source_archive_bytes": archive_stat.st_size,
+        "source_archive_mtime_ns": archive_stat.st_mtime_ns,
+        "reference_path": str(reference_path), "discovery_path": str(discovery_path),
+        "reference_maximum_bytes": byte_limit(reference_size_gb),
+        "discovery_maximum_bytes": byte_limit(discovery_size_gb),
+    }
 
-    reference_limit = byte_limit(REFERENCE_SIZE_GB)
-    discovery_limit = byte_limit(DISCOVERY_SIZE_GB)
-    archive_path = Path(ARCHIVE_PATH).resolve()
-    reference_path = Path(REFERENCE_PATH).resolve()
-    discovery_path = Path(DISCOVERY_PATH).resolve()
-    manifest_path = Path(MANIFEST_PATH).resolve()
+
+def prepare_slices(archive_path, archive_member, reference_path, discovery_path,
+                   reference_size_gb, discovery_size_gb):
+    """Create a consecutive pair once, or verify/reuse its completed manifest.
+
+    An existing reference prefix is allowed so the original 1 GB file and bank
+    remain reusable. An existing discovery file needs this helper's manifest.
+    Changing a size requires new output names for the changed files.
+    """
+    configuration = slice_configuration(archive_path, archive_member, reference_path, discovery_path,
+                                        reference_size_gb, discovery_size_gb)
+    reference_path, discovery_path = Path(configuration["reference_path"]), Path(configuration["discovery_path"])
+    archive_path = Path(configuration["source_archive"])
+    manifest_path = discovery_path.with_suffix(".slices.json")
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("configuration") != configuration:
+            raise ValueError("Slice settings or archive identity differ. Choose new slice output filenames.")
+        for label, path in [("reference", reference_path), ("discovery", discovery_path)]:
+            if path.stat().st_size != manifest[label]["bytes"]:
+                raise ValueError(f"Saved {label} slice size changed: {path}")
+            with path.open("rb") as source:
+                if file_digest(source, "sha256").hexdigest() != manifest[label]["sha256"]:
+                    raise ValueError(f"Saved {label} slice checksum changed: {path}")
+        print("Reusing verified reference/discovery slices; no archive decompression.", flush=True)
+        return manifest
+
     reference_partial = reference_path.with_name(reference_path.name + ".partial")
     discovery_partial = discovery_path.with_name(discovery_path.name + ".partial")
-    paths = [
-        archive_path,
-        reference_path,
-        discovery_path,
-        manifest_path,
-        reference_partial,
-        discovery_partial,
-    ]
-    if len(set(paths)) != len(paths):
-        raise ValueError(
-            "Archive, output, manifest and temporary paths must be distinct."
-        )
-    if not archive_path.is_file():
-        raise FileNotFoundError(
-            f"Set ARCHIVE_PATH to your compressed archive: {archive_path}"
-        )
-    reuse = reference_path.exists() and REUSE_EXISTING_REFERENCE
-    for path in [discovery_path, manifest_path, discovery_partial] + (
-        [] if reuse else [reference_path, reference_partial]
-    ):
+    for path in (discovery_path, reference_partial, discovery_partial):
         if path.exists():
-            raise FileExistsError(f"Refusing to overwrite {path}. Choose a new path.")
+            raise FileExistsError(f"Refusing to overwrite {path}. Choose a new slice filename.")
+    reuse_reference = reference_path.exists()
+    if reuse_reference and not reference_path.is_file():
+        raise ValueError(f"Reference path is not a file: {reference_path}")
 
-    # Failure leaves .partial files for inspection, never a misleading final file.
+    # Import lazily: extraction stays local and is never required on Colab.
+    from compression import zstd
+
+    # Failure leaves .partial files for inspection, never a completed manifest.
     with ExitStack() as stack:
         compressed = stack.enter_context(zstd.open(archive_path, "rb"))
         archive = stack.enter_context(tarfile.open(fileobj=compressed, mode="r|"))
-        member = next((item for item in archive if item.name == ARCHIVE_MEMBER), None)
+        member = next((item for item in archive if item.name == archive_member), None)
         if member is None or not member.isfile():
-            raise ValueError(f"NDJSON member not found: {ARCHIVE_MEMBER}")
+            raise ValueError(f"NDJSON member not found: {archive_member}")
         source = stack.enter_context(archive.extractfile(member))
-        for path in (reference_path, discovery_path, manifest_path):
-            path.parent.mkdir(parents=True, exist_ok=True)
-        print(
-            "Verifying existing reference..." if reuse else "Writing reference...",
-            flush=True,
-        )
-        if reuse:
+        reference_path.parent.mkdir(parents=True, exist_ok=True)
+        discovery_path.parent.mkdir(parents=True, exist_ok=True)
+        print("Verifying existing reference prefix..." if reuse_reference else "Extracting reference prefix...", flush=True)
+        if reuse_reference:
             with reference_path.open("rb") as existing:
-                reference, pending = copy_slice(
-                    source, None, reference_limit, None, existing
-                )
+                reference, pending = copy_slice(source, None, configuration["reference_maximum_bytes"], None, existing)
         else:
             with reference_partial.open("xb") as output:
-                reference, pending = copy_slice(source, None, reference_limit, output)
-        print("Writing consecutive discovery slice...", flush=True)
+                reference, pending = copy_slice(source, None, configuration["reference_maximum_bytes"], output)
+        print("Extracting following discovery slice...", flush=True)
         with discovery_partial.open("xb") as output:
-            discovery, _ = copy_slice(source, pending, discovery_limit, output)
+            discovery, _ = copy_slice(source, pending, configuration["discovery_maximum_bytes"], output)
 
+    if slice_configuration(archive_path, archive_member, reference_path, discovery_path,
+                           reference_size_gb, discovery_size_gb) != configuration:
+        raise ValueError("Archive changed during extraction; outputs have not been published.")
     manifest = {
+        "configuration": configuration,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "source_archive": str(archive_path),
-        "source_archive_bytes": archive_path.stat().st_size,
-        "source_member": ARCHIVE_MEMBER,
         "selection": "Consecutive complete threads in archive order; not random sampling",
-        "reference": {
-            "path": str(reference_path),
-            "reused": reuse,
-            "first_source_line": 1,
-            **reference,
-        },
-        "discovery": {
-            "path": str(discovery_path),
-            "first_source_line": reference["threads"] + 1,
-            **discovery,
-        },
-        "limitations": ["No duplicate-text or cross-thread-quotation filtering"],
+        "reference": {"path": str(reference_path), "reused_existing_prefix": reuse_reference,
+                      "first_source_line": 1, **reference},
+        "discovery": {"path": str(discovery_path), "first_source_line": reference["threads"] + 1, **discovery},
+        "limitations": ["Slice membership does not remove copied text or cross-thread quotations",
+                        "Archive identity uses path, byte size and modification time; slice contents use SHA-256"],
     }
-    if not reuse:
+    if discovery_path.exists() or (not reuse_reference and reference_path.exists()):
+        raise FileExistsError("Slice output appeared during extraction; refusing to overwrite it.")
+    if not reuse_reference:
         reference_partial.rename(reference_path)
     discovery_partial.rename(discovery_path)
     with manifest_path.open("x", encoding="utf-8") as output:
         json.dump(manifest, output, indent=2)
         output.write("\n")
-    print(f"Reference: {reference['threads']:,} threads, {reference['bytes']:,} bytes")
-    print(f"Discovery: {discovery['threads']:,} threads, {discovery['bytes']:,} bytes")
-    print(f"Manifest: {manifest_path}")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"Reference: {reference['threads']:,} threads, {reference['bytes']:,} bytes", flush=True)
+    print(f"Discovery: {discovery['threads']:,} threads, {discovery['bytes']:,} bytes", flush=True)
+    print(f"Slice manifest: {manifest_path}", flush=True)
+    return manifest

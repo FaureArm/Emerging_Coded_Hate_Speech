@@ -1,36 +1,10 @@
-"""Build BERT reference vectors once from Prepare_Reference.ipynb's saved corpus.
+"""Internal Colab worker: encode a prepared reference corpus once.
 
-Run from the repository root: .venv/bin/python src/build_reference_bank.py
-Relative paths below are resolved from the working directory, normally /content
-on Colab. The script refuses to overwrite an existing bank or download archive.
-
-Colab CLI commands (run yourself from the repository root; adjust the category
-folder below and the parameters together if using a different prepared corpus):
-
-    colab new -s references --gpu T4
-    colab install -s references pandas numpy torch transformers tqdm
-    zip -r reference_bank_inputs.zip src/utils \
-      data/raiders/reference_corpora/antisemitism_v1 -x '*/__pycache__/*'
-    colab upload -s references reference_bank_inputs.zip content/reference_bank_inputs.zip
-    echo 'import zipfile; zipfile.ZipFile("/content/reference_bank_inputs.zip").extractall("/content")' | colab exec -s references
-    colab exec -s references -f src/build_reference_bank.py --timeout 7200
-    colab download -s references content/artifacts/reference_banks/antisemitism_v1.zip artifacts/reference_bank_antisemitism_v1.zip
-
-Only the prepared corpus and helpers are uploaded, not the 1 GB reference source.
-The discovery runner consumes this saved bank; encoding is an occasional setup step.
+Normally invoked by run_pipeline.py. No local notebook preparation is required.
 """
 
+import argparse
 from pathlib import Path
-
-# -------------------------- Editable parameters --------------------------
-REFERENCE_CORPUS_DIR = Path("data/raiders/reference_corpora/antisemitism_v1")
-REFERENCE_BANK_DIR = Path("artifacts/reference_banks/antisemitism_v1")
-CHECKPOINT = "google-bert/bert-base-uncased"
-MODEL_REVISION = "main"  # Resolved to one commit before loading model and tokenizer.
-CONTEXT_TOKENS = 64      # Surrounding subword tokens on EACH side, as in the runner.
-DEVICE = "auto"         # auto / cuda / cpu
-CREATE_ZIP = True
-# -------------------------------------------------------------------------
 
 import shutil
 import sys
@@ -46,18 +20,30 @@ from utils.reference_bank import load_reference_corpus, load_reference_bank, sav
 from utils.reference_review import file_sha256
 
 
-def main():
+def parse_arguments(arguments=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reference-corpus", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--checkpoint", default="google-bert/bert-base-uncased")
+    parser.add_argument("--revision", default="main")
+    parser.add_argument("--context-tokens", type=int, default=64)
+    parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="cuda")
+    return parser.parse_args(arguments)
+
+
+def main(arguments=None):
+    arguments = parse_arguments(arguments)
     started_at = datetime.now(timezone.utc).isoformat()
     started = perf_counter()
-    corpus_dir = REFERENCE_CORPUS_DIR.resolve()
-    bank_dir = REFERENCE_BANK_DIR.resolve()
+    corpus_dir = arguments.reference_corpus.resolve()
+    bank_dir = arguments.output.resolve()
     archive_path = Path(str(bank_dir) + ".zip")
-    if bank_dir.exists() or (CREATE_ZIP and archive_path.exists()):
+    if bank_dir.exists() or archive_path.exists():
         raise FileExistsError(f"Bank or ZIP already exists at {bank_dir}. Choose a new bank name.")
-    if type(CONTEXT_TOKENS) is not int or CONTEXT_TOKENS < 0:
-        raise ValueError("CONTEXT_TOKENS must be a nonnegative integer.")
-    if DEVICE not in {"auto", "cuda", "cpu"}:
-        raise ValueError("DEVICE must be auto, cuda or cpu.")
+    if type(arguments.context_tokens) is not int or arguments.context_tokens < 0:
+        raise ValueError("arguments.context_tokens must be a nonnegative integer.")
+    if arguments.device not in {"auto", "cuda", "cpu"}:
+        raise ValueError("arguments.device must be auto, cuda or cpu.")
 
     posts, occurrences, preparation_manifest = load_reference_corpus(corpus_dir)
     print(f"Validated {len(posts):,} posts and {len(occurrences):,} anchor occurrences.", flush=True)
@@ -69,18 +55,18 @@ def main():
     from transformers import AutoModel, AutoTokenizer
     from utils import embeddings
 
-    device = torch.device("cuda" if DEVICE == "auto" and torch.cuda.is_available()
-                          else "cpu" if DEVICE == "auto" else DEVICE)
+    device = torch.device("cuda" if arguments.device == "auto" and torch.cuda.is_available()
+                          else "cpu" if arguments.device == "auto" else arguments.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable in this runtime.")
-    print(f"Loading {CHECKPOINT} on {device}...", flush=True)
-    resolved_revision = HfApi().model_info(CHECKPOINT, revision=MODEL_REVISION).sha
+    print(f"Loading {arguments.checkpoint} on {device}...", flush=True)
+    resolved_revision = HfApi().model_info(arguments.checkpoint, revision=arguments.revision).sha
     if not resolved_revision:
         raise ValueError("Could not resolve a Hugging Face model commit; use a Hub model checkpoint.")
-    tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, revision=resolved_revision, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(arguments.checkpoint, revision=resolved_revision, use_fast=True)
     if not tokenizer.is_fast:
         raise ValueError("A fast tokenizer with character offsets is required.")
-    model = AutoModel.from_pretrained(CHECKPOINT, revision=resolved_revision).to(device)
+    model = AutoModel.from_pretrained(arguments.checkpoint, revision=resolved_revision).to(device)
     model.eval()
 
     # Original Raiders post IDs, not fresh DataFrame row numbers.
@@ -89,16 +75,16 @@ def main():
     (
         occurrence_metadata, _, occurrence_vectors, _, _,
         reference_vectors, reference_metadata, _,
-    ) = embeddings.embed_anchors(occurrences, embedding_posts, model, tokenizer, device, CONTEXT_TOKENS)
+    ) = embeddings.embed_anchors(occurrences, embedding_posts, model, tokenizer, device, arguments.context_tokens)
 
     embedding_config = {
         "procedure": embeddings.EMBEDDING_PROCEDURE,
-        "checkpoint": CHECKPOINT,
-        "requested_revision": MODEL_REVISION,
+        "checkpoint": arguments.checkpoint,
+        "requested_revision": arguments.revision,
         "resolved_revision": resolved_revision,
-        "tokenizer_checkpoint": CHECKPOINT,
+        "tokenizer_checkpoint": arguments.checkpoint,
         "tokenizer_revision": resolved_revision,
-        "context_tokens_each_side": CONTEXT_TOKENS,
+        "context_tokens_each_side": arguments.context_tokens,
         "layer": "last_hidden_state",
         "pooling": "mean of subword tokens overlapping the selected anchor span; special tokens excluded",
         "aggregation": "mean of selected occurrence vectors per (anchor, post_id)",
@@ -125,9 +111,8 @@ def main():
     print(f"Saved and verified {saved_vectors.shape[0]:,} reference vectors of dimension {saved_vectors.shape[1]}.")
     print(f"Anchors represented: {saved_metadata['anchor'].nunique()} / {len(preparation_manifest['config']['anchors'])}")
     print(f"Reference bank: {bank_dir}")
-    if CREATE_ZIP:
-        shutil.make_archive(str(bank_dir), "zip", root_dir=bank_dir.parent, base_dir=bank_dir.name)
-        print(f"Download archive: {archive_path} ({archive_path.stat().st_size / 1e6:.1f} MB)")
+    shutil.make_archive(str(bank_dir), "zip", root_dir=bank_dir.parent, base_dir=bank_dir.name)
+    print(f"Download archive: {archive_path} ({archive_path.stat().st_size / 1e6:.1f} MB)")
     print(f"Finished in {perf_counter() - started:.1f} seconds.")
 
 

@@ -29,7 +29,7 @@ from utils.reference_bank import save_reference_bank, load_reference_bank, valid
 from utils.reference_review import prepare_references, extract_readable_post_text, compile_phrase_pattern
 from utils.results import load_run, inspection_view, highlight_word_spans
 from utils.scoring import score_fixed_reference_bank, summarize_rankings
-from utils.vocabulary import anchor_terms_by_hate_category
+from utils.vocabulary import HATE_CATEGORIES, anchor_terms_by_hate_category, seed_words_by_hate_category
 
 
 class TinyTokenizer:
@@ -84,14 +84,15 @@ def write_records(path, records):
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
 
-def build_fixture_bank(directory):
-    anchors = anchor_terms_by_hate_category["antisemitism"]
+def build_fixture_bank(directory, category="antisemitism"):
+    anchors = anchor_terms_by_hate_category[category]
+    first_anchor = next(iter(anchors.values()))[0]
     source = directory / "reference.ndjson"
-    write_records(source, [make_record(100 + index * 10, [f"kike reference context {index}."])
+    write_records(source, [make_record(100 + index * 10, [f"{first_anchor} reference context {index}."])
                            for index in range(6)])
     with redirect_stdout(StringIO()):
         posts, occurrences, _, preparation = prepare_references(
-            source, directory / "corpus", anchors, "antisemitism", max_per_anchor=15, random_seed=42)
+            source, directory / "corpus", anchors, category, max_per_anchor=15, random_seed=42)
     configuration = {
         "procedure": embeddings.EMBEDDING_PROCEDURE,
         "checkpoint": "fixture-model", "requested_revision": "fixture-revision",
@@ -120,10 +121,32 @@ class ReproductionTests(unittest.TestCase):
         self.bank = build_fixture_bank(self.directory)
         self.vectors, self.references, self.reference_posts, self.manifest = load_reference_bank(self.bank)
         self.references = validate_discovery_bank(self.vectors, self.references, self.reference_posts,
-                                                 self.manifest, anchor_terms_by_hate_category["antisemitism"])
+                                                 self.manifest, anchor_terms_by_hate_category["antisemitism"], category="antisemitism")
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_category_cli_defaults_follow_selected_category(self):
+        for category in HATE_CATEGORIES:
+            with self.subTest(category=category):
+                arguments = run_reproduction.parse_arguments(["--category", category])
+                self.assertEqual(arguments.category, category)
+                self.assertEqual(arguments.reference_bank.name, f"{category}_v1")
+                self.assertTrue(arguments.output.name.startswith(f"raiders_{category}_"))
+
+    def test_wrong_category_bank_is_rejected_before_retrieval_or_embedding(self):
+        arguments = run_reproduction.parse_arguments([
+            "--category", "islamophobia", "--reference-bank", str(self.bank),
+            "--input", str(self.directory / "not_read.ndjson"),
+            "--output", str(self.directory / "not_created"),
+        ])
+        with patch("utils.discovery.retrieve_discovery_posts") as retrieve, \
+             patch("utils.embeddings.load_embedding_model") as model, redirect_stdout(StringIO()):
+            with self.assertRaisesRegex(ValueError, "category mismatch.*islamophobia.*antisemitism"):
+                run_reproduction.run_experiment(arguments)
+        retrieve.assert_not_called()
+        model.assert_not_called()
+        self.assertFalse(arguments.output.exists())
 
     def test_retrieval_separation_and_limit(self):
         source = self.directory / "discovery.ndjson"
@@ -224,12 +247,12 @@ class ReproductionTests(unittest.TestCase):
         bad_configuration["embedding_config"]["tokenizer_revision"] = "another-revision"
         with self.assertRaisesRegex(ValueError, "resolved revision"):
             validate_discovery_bank(self.vectors, self.references, self.reference_posts,
-                                    bad_configuration, anchor_terms_by_hate_category["antisemitism"])
+                                    bad_configuration, anchor_terms_by_hate_category["antisemitism"], category="antisemitism")
         misaligned = self.references.copy()
         misaligned.loc[0, "thread_id"] = 99999
         with self.assertRaisesRegex(ValueError, "metadata disagrees"):
             validate_discovery_bank(self.vectors, misaligned, self.reference_posts,
-                                    self.manifest, anchor_terms_by_hate_category["antisemitism"])
+                                    self.manifest, anchor_terms_by_hate_category["antisemitism"], category="antisemitism")
         metadata_path = self.bank / "reference_metadata.csv"
         metadata_path.write_text(metadata_path.read_text() + "\n")
         with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
@@ -248,7 +271,7 @@ class ReproductionTests(unittest.TestCase):
             "Jewish generations after the Holocaust.", "Jewish quiet town and silver tree.",
         ])])
         output = self.directory / "run"
-        arguments = SimpleNamespace(input=source, reference_bank=self.bank, output=output,
+        arguments = SimpleNamespace(category="antisemitism", input=source, reference_bank=self.bank, output=output,
                                     max_posts=4, batch_size=16, device="cpu")
         bank_checksums = {path.name: sha256(path.read_bytes()).hexdigest() for path in self.bank.iterdir()}
         with patch("utils.preprocessing.load_nlp_tools", return_value=({"after", "the", "and"}, PunktSentenceTokenizer(), NLTKWordTokenizer())), \
@@ -283,9 +306,10 @@ notebook = json.loads(Path('src/Results.ipynb').read_text())
 namespace = {}
 for cell in notebook['cells']:
     if cell['cell_type'] == 'code':
-        source = ''.join(cell['source']).replace(
-            'RUN_DIRECTORY = PROJECT_ROOT / "artifacts/raiders_antisemitism_broad_seeds"',
-            'RUN_DIRECTORY = Path(' + repr(RUN_PATH) + ')')
+        source = ''.join(cell['source'])
+        source = '\\n'.join(
+            'RUN_DIRECTORY = Path(' + repr(RUN_PATH) + ')' if line.startswith('RUN_DIRECTORY = ') else line
+            for line in source.split('\\n'))
         exec(compile(source, cell['id'], 'exec'), namespace)
 print('OFFLINE_NOTEBOOK_OK')
 '''

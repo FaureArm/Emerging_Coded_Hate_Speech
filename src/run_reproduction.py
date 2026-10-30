@@ -3,7 +3,7 @@
 From any working directory:
     python /path/to/project/src/run_reproduction.py --max-posts 1000
 
-See README.md for the occasional reference setup and Colab CLI commands.
+Normally invoked by the configurable root run_pipeline.py launcher.
 This script never builds reference vectors from discovery posts.
 """
 
@@ -14,6 +14,8 @@ from pathlib import Path
 import random
 import subprocess
 from time import perf_counter
+
+from utils.vocabulary import HATE_CATEGORIES, vocabulary_for_category
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,14 +28,22 @@ def project_path(value):
 
 def parse_arguments(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--category", choices=HATE_CATEGORIES, default="antisemitism",
+                        help="Select both retrieval seeds and anchors from utils/vocabulary.py")
     parser.add_argument("--input", type=project_path, default=PROJECT_ROOT / "data/raiders/raiders_first_1GB.ndjson")
-    parser.add_argument("--reference-bank", type=project_path, default=PROJECT_ROOT / "artifacts/reference_banks/antisemitism_v1")
-    parser.add_argument("--output", type=project_path, default=PROJECT_ROOT / "artifacts" /
-                        datetime.now(timezone.utc).strftime("raiders_antisemitism_%Y%m%dT%H%M%S_%fZ"))
+    parser.add_argument("--reference-bank", type=project_path, default=None,
+                        help="Encoded bank; defaults to artifacts/reference_banks/<category>_v1")
+    parser.add_argument("--output", type=project_path, default=None)
     parser.add_argument("--max-posts", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=16, help="Candidate BERT window batch size")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    return parser.parse_args(arguments)
+    parsed = parser.parse_args(arguments)
+    if parsed.reference_bank is None:
+        parsed.reference_bank = PROJECT_ROOT / "artifacts/reference_banks" / f"{parsed.category}_v1"
+    if parsed.output is None:
+        parsed.output = PROJECT_ROOT / "artifacts" / (
+            f"raiders_{parsed.category}_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
+    return parsed
 
 
 def enrich_candidate_metadata(metadata, posts):
@@ -76,7 +86,9 @@ def run_experiment(arguments):
     from utils.reference_bank import load_reference_bank, validate_discovery_bank
     from utils.reference_review import file_sha256
     from utils.scoring import score_fixed_reference_bank, summarize_rankings
-    from utils.vocabulary import anchor_terms_by_hate_category, seed_words_by_hate_category
+
+    category = arguments.category
+    anchors, seed_words = vocabulary_for_category(category)
 
     if arguments.max_posts < 1 or arguments.batch_size < 1:
         raise ValueError("--max-posts and --batch-size must be positive.")
@@ -85,7 +97,7 @@ def run_experiment(arguments):
     if not (arguments.reference_bank / "bank_manifest.json").is_file():
         raise FileNotFoundError(
             f"No encoded reference bank at {arguments.reference_bank}. "
-            "Build it once with src/build_reference_bank.py on Colab, or set --reference-bank. "
+            "Use run_pipeline.py to prepare and encode it on Colab, or set --reference-bank. "
             "Discovery will not generate replacement reference vectors."
         )
     started_at = datetime.now(timezone.utc).isoformat()
@@ -94,13 +106,12 @@ def run_experiment(arguments):
     random_seed = 42
     random.seed(random_seed)
     np.random.seed(random_seed)
-    anchors = anchor_terms_by_hate_category["antisemitism"]
-    seed_words = list(seed_words_by_hate_category["antisemitism"])
-
+    print(f"Category: {category}; {len(anchors)} anchors; retrieval seeds: {seed_words}", flush=True)
     print("1/5: Validating the fixed reference bank", flush=True)
     stage_started = perf_counter()
     reference_vectors, reference_metadata, reference_posts, bank_manifest = load_reference_bank(arguments.reference_bank)
-    reference_metadata = validate_discovery_bank(reference_vectors, reference_metadata, reference_posts, bank_manifest, anchors)
+    reference_metadata = validate_discovery_bank(reference_vectors, reference_metadata, reference_posts, bank_manifest,
+                                                 anchors, category=category)
     bank_identifier = file_sha256(arguments.reference_bank / "bank_manifest.json")
     reference_coverage = pd.read_csv(arguments.reference_bank / "anchor_coverage.csv", keep_default_na=False)
     stage_times["reference_loading"] = perf_counter() - stage_started
@@ -155,8 +166,8 @@ def run_experiment(arguments):
     stage_counts["relevance_survivors"] = int(rankings["passes_relevance"].sum())
     run_info = {
         "format_version": 1, "status": "complete", "started_at_utc": started_at,
-        "category": "antisemitism", "seed_words": seed_words, "anchor_terms": anchors,
-        "seed_provenance": "User's experimental broad seeds, not Wu's published seed selection",
+        "category": category, "seed_words": seed_words, "anchor_terms": anchors,
+        "seed_provenance": f"Experimental seeds from vocabulary.py for {category}; not Wu's published seed selection",
         "requested_max_posts": arguments.max_posts, "retrieval": retrieval_info,
         "reference_bank": {"path": str(arguments.reference_bank), "identifier_sha256": bank_identifier,
                            "manifest": bank_manifest},

@@ -196,3 +196,17 @@ seed_words_by_hate_category = {
         "transphobia",
     ],
 }
+
+
+HATE_CATEGORIES = tuple(sorted(anchor_terms_by_hate_category.keys() & seed_words_by_hate_category.keys()))
+
+
+def vocabulary_for_category(category):
+    """Select anchors and retrieval seeds together, with no category fallback."""
+    if category not in HATE_CATEGORIES:
+        raise ValueError(f"Unknown hate category {category!r}. Choose one of: {', '.join(HATE_CATEGORIES)}")
+    anchors = anchor_terms_by_hate_category[category]
+    seeds = list(seed_words_by_hate_category[category])
+    if not anchors or not seeds or any(not isinstance(word, str) or not word.strip() for word in seeds):
+        raise ValueError(f"Category {category!r} needs nonempty anchors and retrieval seeds in vocabulary.py.")
+    return anchors, seeds
