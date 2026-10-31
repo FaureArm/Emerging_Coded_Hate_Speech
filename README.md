@@ -36,6 +36,8 @@ The launcher uses your installed, authenticated Colab CLI; it detects `colab` on
 | `MAX_REFERENCES_PER_ANCHOR` | Maximum distinct contexts per anchor; `None` removes the cap |
 | `REFERENCE_RANDOM_SEED` | Reproducible selection of reference contexts |
 | `MAX_DISCOVERY_POSTS` | Maximum eligible seed-matching posts processed, not the number of raw posts scanned |
+| `DISCOVERY_SAMPLING_METHOD` | `"first_matching"` (default) stops at the cap; `"uniform_time"` balances matches across UTC days in the full discovery slice |
+| `DISCOVERY_RANDOM_SEED` | Reproducible discovery sampling for `"uniform_time"`; independent of `REFERENCE_RANDOM_SEED` |
 | `CANDIDATE_BATCH_SIZE` | Candidate embedding batch size on the GPU |
 | `RUN_NAME` | New experiment name; `None` generates a unique timestamped name |
 | `BERT_CHECKPOINT`, `MODEL_REVISION`, `CONTEXT_TOKENS_EACH_SIDE` | Reference and candidate embedding settings; defaults retain the first completed run's model revision and 64 surrounding subwords per side |
@@ -73,7 +75,7 @@ If retries are exhausted or you interrupt the launcher, it retains the frozen in
 
 Use the printed checkpoint path with the original Colab session still alive. Resume retains the same run name and workspace, verifies uploaded/downloaded parts by size and SHA-256, and transfers only missing or damaged parts. Completed reference encoding and discovery stages are reused. A failed BERT job has no embedding-level checkpoint; a partial remote output directory may still require manual recovery.
 
-Keep the experiment settings, selected category, vocabulary and source files unchanged; resume rejects mismatches and a missing/corrupt saved archive. The printed resume command includes the saved category. Transfer retry/timeout settings may be adjusted. `--check --resume <path>` validates the checkpoint configuration without remote calls. Older checkpoints without the category/vocabulary snapshot must start a new run.
+Keep the experiment settings, selected category, vocabulary and source files unchanged; resume rejects mismatches and a missing/corrupt saved archive. The printed resume command includes the saved category. Transfer retry/timeout settings may be adjusted. `--check --resume <path>` validates the checkpoint configuration without remote calls. Older checkpoints without the category/vocabulary snapshot or discovery sampling settings must start a new run.
 
 ### Results and subsequent runs
 
@@ -88,6 +90,31 @@ Each experiment also contains `pipeline_settings.json` and a copy of the launche
 Open **`src/Results.ipynb`** and set `RUN_DIRECTORY` to the path printed by the launcher. It reads saved tables locally, without BERT, downloads or the reference bank. Existing notebook outputs are left untouched.
 
 For another experiment, change the discovery settings and use a new `RUN_NAME` (or keep `None`). Keep the same category and reference settings/version to reuse the bank. To use the earlier antisemitism v1 bank, select `antisemitism` and set **both** `REFERENCE_VERSION = "antisemitism_v1"` and `MAX_REFERENCES_PER_ANCHOR = 15`.
+
+### Choose how discovery posts are selected
+
+Edit these settings in `run_pipeline.py`:
+
+```python
+MAX_DISCOVERY_POSTS = 10000
+DISCOVERY_SAMPLING_METHOD = "uniform_time"  # Or "first_matching" for the previous behaviour.
+DISCOVERY_RANDOM_SEED = 42
+```
+
+- **`first_matching`** keeps the first eligible seed-matching posts in source order and stops at `MAX_DISCOVERY_POSTS`. Increasing the slice size does not change those posts if the original prefix already fills the cap.
+- **`uniform_time`** scans the **entire discovery slice** to count eligible posts per **UTC calendar day**, then scans again to randomly select approximately equal numbers from each day. The day is determined by each post's timestamp, including replies, rather than the thread opener or file order. All existing seed matching and reference thread/text exclusions apply before sampling.
+
+For example, a 10,000-post cap over 20 days gives 500 posts per day when each day has enough matches. Sparse days contribute all their eligible posts; unused places are redistributed across the remaining days. Rounding leftovers are assigned using the random seed. Days without eligible posts cannot contribute; if the cap is smaller than the number of eligible days, a seeded random subset of days receives one post each. When the entire slice has fewer matches than the cap, all eligible posts are retained. Missing or invalid timestamps on eligible posts are errors in this mode.
+
+The same source, vocabulary, reference bank, code and random seed reproduce the selection. Change `DISCOVERY_RANDOM_SEED` to try another sample. Results retain source order after selection. Sampling changes do **not** rebuild a matching reference bank; use a new `RUN_NAME`, or leave it as `None`.
+
+Both full scans happen **on Colab**, before candidate extraction and embeddings. Post bodies are streamed; only selected bodies are retained, while source-ID sets grow with the scan to detect duplicates. This increases reading/parsing time, but BERT still receives at most `MAX_DISCOVERY_POSTS` posts (the number of candidate occurrences and embedding time can vary). `--check` only validates the settings; it does not scan the corpus.
+
+`pipeline_settings.json` saves the chosen mode and seed. `run_info.json` → `retrieval` also saves `sampling_method`, `sampling_random_seed`, `scan_passes`, and `daily_counts` (eligible and selected counts by UTC day in `uniform_time` mode). Scan counters describe one traversal, not the sum of both passes. The existing results notebook reads the resulting artifacts as before.
+
+This balances the dates **present in the chosen slice**; it cannot recover dates outside that slice. The sample remains seed-conditioned and is not a frequency-representative sample of all posts. Daily balancing also does not guarantee even coverage within each day.
+
+The internal worker exposes the same choice as `--sampling-method uniform_time --sampling-random-seed 42`; the launcher supplies these automatically.
 
 ### Change the raw slices in the same launcher
 
@@ -131,7 +158,7 @@ This is the smallest split compatible with the prepared bank. It does **not** re
 
 Identity is `4chan:pol:<source id>` for posts and threads; the reader rejects reference banks from another board. Numeric IDs are original archive IDs, never reset DataFrame row numbers. Saved posts include thread identity, timestamp, matched seeds, raw source JSON and the exact readable text. `resto` is used only to verify thread membership; it is not treated as a direct reply parent. No conversation graph or context model is implemented.
 
-Reproducibility records include the consumed complete-line prefix SHA-256, source path/size, bank-manifest identifier, seeds, software versions, code hashes/Git status, random seed and timings. The untouched suffix is not read merely to hash the entire input. Retain the original input and commit the source version used for a reported experiment.
+Reproducibility records include the consumed complete-line prefix SHA-256, source path/size, bank-manifest identifier, seeds, software versions, code hashes/Git status, random seed and timings. In `first_matching` mode, the untouched suffix is not read merely to hash the entire input. In `uniform_time` mode, the consumed-prefix hash covers the full slice, and both passes must match. Retain the original input and commit the source version used for a reported experiment.
 
 ### Preserved methodology and explicit corrections
 
@@ -171,6 +198,6 @@ Each completed run writes:
 .venv/bin/python -B -m unittest discover -s tests -v
 ```
 
-Tests exercise reference/thread/text exclusion, source identities, phrase matching, text offsets, target-token pooling, repeated-occurrence aggregation, top-five scoring and failure guards. A small complete orchestration test uses **synthetic reference vectors and a fake encoder**, then executes every results-notebook cell in a fresh process with torch/transformers/NLTK imports forbidden. This validates wiring and artifact inspection, not actual BERT quality or a real GPU run. The reference bank is checked for unchanged contents after testing. Launcher tests simulate Colab and exercise new-bank creation, directory/ZIP cache reuse, changed-setting rejection, chunked transfers, corrupt/missing parts, extraction safety, remote failures and no-side-effect check mode. Slice tests use actual tiny tar/zstd archives to check consecutive boundaries, existing-prefix reuse, cache hashes, changed-size/corruption errors and integration before reference preparation. These tests do not create a real Colab session.
+Tests exercise first-match early stopping, UTC-day balancing and sparse-day redistribution, reproducible samples, timestamp validation, changed-source detection, reference/thread/text exclusion, source identities, phrase matching, text offsets, target-token pooling, repeated-occurrence aggregation, top-five scoring and failure guards. A small complete orchestration test uses **synthetic reference vectors and a fake encoder**, then executes every results-notebook cell in a fresh process with torch/transformers/NLTK imports forbidden. This validates wiring and artifact inspection, not actual BERT quality or a real GPU run. The reference bank is checked for unchanged contents after testing. Launcher tests simulate Colab and exercise sampling-setting forwarding, bank reuse across sampling modes, new-bank creation, directory/ZIP cache reuse, changed-setting rejection, chunked transfers, corrupt/missing parts, extraction safety, remote failures and no-side-effect check mode. Slice tests use actual tiny tar/zstd archives to check consecutive boundaries, existing-prefix reuse, cache hashes, changed-size/corruption errors and integration before reference preparation. These tests do not create a real Colab session.
 
 Additional checks on 2026-10-27: CPU retrieval/candidate extraction selected 1,000 real posts from 222 threads after excluding 4 reference threads (872 posts) in the consumed prefix. It produced 4,822 TF-IDF-selected candidates, 13,518 occurrences and 1,454 flagged noncontiguous occurrences. No candidate embeddings were computed for that sample. Top-five scoring on 256 eligible rows of the older saved matrices exactly matched the old per-post calculation; synthetic thread keys were used only for that numerical comparison, not to claim independence of the historical corpus.

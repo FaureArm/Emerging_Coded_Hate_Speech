@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from hashlib import sha256
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -21,7 +22,7 @@ from nltk.tokenize import NLTKWordTokenizer, PunktSentenceTokenizer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 import run_reproduction
-from utils import embeddings
+from utils import discovery, embeddings
 from utils.candidates import build_ngrams, build_pos_ngrams, apply_pos_filter, find_candidate_occurrences
 from utils.discovery import retrieve_discovery_posts, normalized_text_hash
 from utils.preprocessing import cleanup, tokenize_with_positions
@@ -171,6 +172,116 @@ class ReproductionTests(unittest.TestCase):
         self.assertIsNone(compile_phrase_pattern("jew").search("jewellery"))
         self.assertIsNotNone(compile_phrase_pattern("great replacement").search("great \n replacement"))
 
+    def dated_discovery_source(self, counts_by_day):
+        records = []
+        for day_offset, count in enumerate(counts_by_day):
+            for _ in range(count):
+                record = make_record(1000 + len(records) * 10, ["jewish fictional sample"])
+                record["posts"][0]["time"] = 1467331200 + day_offset * 86400
+                records.append(record)
+        # Archive order need not match post timestamps.
+        source = self.directory / "dated.ndjson"
+        write_records(source, list(reversed(records)))
+        return source
+
+    def test_first_matching_still_stops_before_unread_suffix(self):
+        source = self.dated_discovery_source([10, 10])
+        valid_lines = source.read_bytes().splitlines(keepends=True)
+        with source.open("ab") as output:
+            output.write(b"invalid unread JSON\n")
+        posts, _, info = retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 3)
+        self.assertEqual(posts.post_id.tolist(), [1190, 1180, 1170])
+        self.assertEqual(info["stop_reason"], "maximum_posts")
+        self.assertEqual(info["sampling_method"], "first_matching")
+        self.assertIsNone(info["sampling_random_seed"])
+        self.assertEqual(info["scan_passes"], 1)
+        self.assertEqual(info["consumed_prefix_sha256"], sha256(b"".join(valid_lines[:3])).hexdigest())
+
+    def test_uniform_time_balances_days_and_redistributes_sparse_capacity(self):
+        source = self.dated_discovery_source([1, 10, 10])
+        posts, summary, info = retrieve_discovery_posts(
+            source, ["jewish"], self.reference_posts, 9, "uniform_time", 42)
+        self.assertEqual([row["eligible_posts"] for row in info["daily_counts"]], [1, 10, 10])
+        self.assertEqual([row["selected_posts"] for row in info["daily_counts"]], [1, 4, 4])
+        actual_days = pd.to_datetime(posts.timestamp, unit="s", utc=True).dt.strftime("%Y-%m-%d")
+        self.assertEqual(actual_days.value_counts().sort_index().tolist(), [1, 4, 4])
+        self.assertTrue(posts.source_line.is_monotonic_increasing)
+        self.assertEqual(summary.selected_posts.tolist(), [9])
+        self.assertEqual(info["counts"]["source_records_read"], 21)
+        self.assertEqual(info["counts"]["seed_matched_posts"], 21)
+        self.assertEqual(info["counts"]["selected_posts"], 9)
+        self.assertEqual(info["sampling_random_seed"], 42)
+        self.assertEqual(info["scan_passes"], 2)
+        self.assertEqual(info["stop_reason"], "end_of_file")
+        self.assertEqual(info["consumed_bytes"], source.stat().st_size)
+        self.assertEqual(info["consumed_prefix_sha256"], sha256(source.read_bytes()).hexdigest())
+        json.dumps(info)  # Saved metadata contains only JSON-native values.
+
+    def test_uniform_time_reproducibility_and_limits(self):
+        source = self.dated_discovery_source([12, 12, 12])
+        arguments = (source, ["jewish"], self.reference_posts, 8, "uniform_time")
+        first, _, first_info = retrieve_discovery_posts(*arguments, 123)
+        repeated, _, repeated_info = retrieve_discovery_posts(*arguments, 123)
+        different, _, _ = retrieve_discovery_posts(*arguments, 456)
+        pd.testing.assert_frame_equal(first, repeated)
+        self.assertEqual(first_info, repeated_info)
+        self.assertNotEqual(first.post_id.tolist(), different.post_id.tolist())
+        self.assertEqual(sorted(row["selected_posts"] for row in first_info["daily_counts"]), [2, 3, 3])
+        all_posts, _, _ = retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 40, "uniform_time")
+        original_order, _, _ = retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 40)
+        pd.testing.assert_frame_equal(all_posts, original_order)
+        few_posts, _, info = retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2, "uniform_time")
+        self.assertEqual(len(few_posts), 2)
+        self.assertEqual(sorted(row["selected_posts"] for row in info["daily_counts"]), [0, 1, 1])
+
+    def test_uniform_time_uses_post_dates_and_preserves_reference_exclusions(self):
+        source = self.directory / "exclusions.ndjson"
+        copied_text = self.reference_posts.iloc[0]["text"]
+        records = [make_record(100, ["jewish excluded thread"]), make_record(900, [copied_text.upper()]),
+                   make_record(1000, ["unrelated topic"]),
+                   make_record(1100, ["jewish before midnight", "jewish after midnight"])]
+        for record in records[:3]:
+            record["posts"][0].pop("time")  # Excluded/nonmatching posts do not require dates.
+        records[3]["posts"][0]["time"] = 1467331200 - 1
+        records[3]["posts"][1]["time"] = 1467331200
+        write_records(source, records)
+        posts, _, info = retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 10, "uniform_time")
+        self.assertEqual(posts.post_id.tolist(), [1100, 1101])
+        self.assertEqual([row["date_utc"] for row in info["daily_counts"]], ["2016-06-30", "2016-07-01"])
+        self.assertEqual([row["selected_posts"] for row in info["daily_counts"]], [1, 1])
+        self.assertEqual(info["counts"]["reference_threads_excluded"], 1)
+        self.assertEqual(info["counts"]["reference_text_posts_excluded"], 1)
+
+    def test_uniform_time_rejects_bad_dates_and_empty_selection(self):
+        source = self.directory / "bad_dates.ndjson"
+        for timestamp in (None, "1467331200", True, 0, -1, 10**30):
+            with self.subTest(timestamp=timestamp):
+                record = make_record(900, ["jewish sample"])
+                record["posts"][0]["time"] = timestamp
+                write_records(source, [record])
+                with self.assertRaisesRegex(ValueError, "timestamp"):
+                    retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2, "uniform_time")
+        record["posts"][0]["time"] = None
+        write_records(source, [record])
+        posts, _, _ = retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2)
+        self.assertEqual(len(posts), 1)  # Existing mode remains permissive about missing time.
+        with self.assertRaisesRegex(ValueError, "No discovery posts"):
+            retrieve_discovery_posts(source, ["nonmatching"], self.reference_posts, 2, "uniform_time")
+
+    def test_uniform_time_detects_changed_source_between_passes(self):
+        source = self.dated_discovery_source([4, 4])
+        original_stat = source.stat()
+        allocate_quotas = discovery._allocate_daily_quotas
+
+        def change_text(*arguments):
+            source.write_bytes(source.read_bytes().replace(b"sample", b"edited", 1))
+            os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            return allocate_quotas(*arguments)
+
+        with patch("utils.discovery._allocate_daily_quotas", side_effect=change_text):
+            with self.assertRaisesRegex(ValueError, "changed between"):
+                retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 4, "uniform_time")
+
     def test_offsets_and_legacy_noncontiguous_candidate(self):
         text = extract_readable_post_text('Generations after the Holocaust.<br>"Quoted", &amp; words http://exam<wbr>ple.org')
         with patch("nltk.pos_tag", side_effect=lambda words: [(word, "NN") for word in words]):
@@ -272,7 +383,8 @@ class ReproductionTests(unittest.TestCase):
         ])])
         output = self.directory / "run"
         arguments = SimpleNamespace(category="antisemitism", input=source, reference_bank=self.bank, output=output,
-                                    max_posts=4, batch_size=16, device="cpu")
+                                    max_posts=4, batch_size=16, device="cpu",
+                                    sampling_method="first_matching", sampling_random_seed=42)
         bank_checksums = {path.name: sha256(path.read_bytes()).hexdigest() for path in self.bank.iterdir()}
         with patch("utils.preprocessing.load_nlp_tools", return_value=({"after", "the", "and"}, PunktSentenceTokenizer(), NLTKWordTokenizer())), \
              patch("nltk.pos_tag", side_effect=lambda words: [(word, "NN") for word in words]), \

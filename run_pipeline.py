@@ -48,6 +48,8 @@ MAX_REFERENCES_PER_ANCHOR = 100  # None keeps all eligible distinct contexts.
 REFERENCE_RANDOM_SEED = 42
 
 MAX_DISCOVERY_POSTS = 10000
+DISCOVERY_SAMPLING_METHOD = "first_matching"  # Or "uniform_time": balance eligible posts across UTC days.
+DISCOVERY_RANDOM_SEED = 42  # Used only by uniform_time; independent of reference selection.
 CANDIDATE_BATCH_SIZE = 16
 RUN_NAME = None  # None creates a unique timestamped name; otherwise use a new name.
 
@@ -283,12 +285,19 @@ def validate_results(run_directory):
     if (run_info["category"] != HATE_CATEGORY or run_info["anchor_terms"] != anchors
             or run_info["seed_words"] != seeds):
         raise ValueError("Downloaded run category, anchors or seeds do not match the selected vocabulary.")
+    retrieval = run_info["retrieval"]
+    expected_seed = DISCOVERY_RANDOM_SEED if DISCOVERY_SAMPLING_METHOD == "uniform_time" else None
+    if (retrieval["sampling_method"] != DISCOVERY_SAMPLING_METHOD
+            or retrieval["sampling_random_seed"] != expected_seed):
+        raise ValueError("Downloaded run discovery sampling settings do not match the launcher.")
     for name, expected in run_info["artifact_checksums"].items():
         if Path(name).name != name or file_digest(run_directory / name) != expected:
             raise ValueError(f"Invalid downloaded artifact: {name}")
 
 
 def configured_paths(saved_run_name=None, allow_existing_outputs=False):
+    from utils.discovery import validate_discovery_sampling
+    validate_discovery_sampling(DISCOVERY_SAMPLING_METHOD, DISCOVERY_RANDOM_SEED)
     anchors, _ = vocabulary_for_category(HATE_CATEGORY)
     reference_version = REFERENCE_VERSION if REFERENCE_VERSION is not None else f"{HATE_CATEGORY}_v1"
     run_name = saved_run_name or RUN_NAME or f"raiders_{HATE_CATEGORY}_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
@@ -359,7 +368,7 @@ def configuration_snapshot(paths):
     """Reject changed experiments on resume; transport settings may be adjusted."""
     names = (
         "HATE_CATEGORY", "REFERENCE_VERSION", "MAX_REFERENCES_PER_ANCHOR", "REFERENCE_RANDOM_SEED",
-        "MAX_DISCOVERY_POSTS", "CANDIDATE_BATCH_SIZE", "RUN_NAME",
+        "MAX_DISCOVERY_POSTS", "DISCOVERY_SAMPLING_METHOD", "DISCOVERY_RANDOM_SEED", "CANDIDATE_BATCH_SIZE", "RUN_NAME",
         "BERT_CHECKPOINT", "MODEL_REVISION", "CONTEXT_TOKENS_EACH_SIDE",
         "EXISTING_COLAB_SESSION", "COLAB_GPU", "TRANSFER_CHUNK_BYTES",
     )
@@ -397,6 +406,9 @@ def run_pipeline(check_only=False, resume=None):
     print(f"Reference version: {paths['reference_version']} (cap {MAX_REFERENCES_PER_ANCHOR} per anchor)")
     print(f"Reference source: {paths['reference_source']}")
     print(f"Discovery: up to {MAX_DISCOVERY_POSTS:,} matching posts from {paths['discovery_source']}")
+    print(f"Discovery selection: {DISCOVERY_SAMPLING_METHOD}")
+    if DISCOVERY_SAMPLING_METHOD == "uniform_time":
+        print(f"Balance UTC days using seed {DISCOVERY_RANDOM_SEED}; two full scans on Colab before embedding selected posts.")
     print(f"Results: {paths['run']}")
     print(f"Colab CLI: {executable}")
     if paths["slice_configuration"] is not None:
@@ -449,6 +461,7 @@ def run_pipeline(check_only=False, resume=None):
         "discovery_source": str(paths["discovery_source"]), "max_references_per_anchor": MAX_REFERENCES_PER_ANCHOR,
         "reference_random_seed": REFERENCE_RANDOM_SEED, "seed_words": seed_words,
         "max_discovery_posts": MAX_DISCOVERY_POSTS, "candidate_batch_size": CANDIDATE_BATCH_SIZE,
+        "discovery_sampling_method": DISCOVERY_SAMPLING_METHOD, "discovery_random_seed": DISCOVERY_RANDOM_SEED,
         "bert_checkpoint": BERT_CHECKPOINT, "model_revision": MODEL_REVISION,
         "context_tokens_each_side": CONTEXT_TOKENS_EACH_SIDE, "reference_bank_reused": reuse_bank,
         "run_name": paths["run"].name, "colab_session": session_name,
@@ -547,6 +560,8 @@ if not Path({str(remote_bank) + '.zip'!r}).is_file():
                          "--input", str(remote_workspace / "inputs/discovery.ndjson"),
                          "--reference-bank", str(remote_bank), "--output", str(remote_run),
                          "--max-posts", str(MAX_DISCOVERY_POSTS), "--batch-size", str(CANDIDATE_BATCH_SIZE),
+                         "--sampling-method", settings["discovery_sampling_method"],
+                         "--sampling-random-seed", str(settings["discovery_random_seed"]),
                          "--device", "cuda", "--category", settings["category"]]
             client.execute(f'''from pathlib import Path
 import subprocess

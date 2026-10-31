@@ -113,6 +113,7 @@ class PipelineTests(unittest.TestCase):
             pipeline, PROJECT_ROOT=self.project, REFERENCE_SOURCE="reference.ndjson", DISCOVERY_SOURCE="discovery.ndjson",
             HATE_CATEGORY="antisemitism", REFERENCE_VERSION="antisemitism_test", MAX_REFERENCES_PER_ANCHOR=15,
             MAX_DISCOVERY_POSTS=4, RUN_NAME="first_run",
+            DISCOVERY_SAMPLING_METHOD="first_matching", DISCOVERY_RANDOM_SEED=42,
             COLAB_EXECUTABLE=sys.executable, EXISTING_COLAB_SESSION=None, TRANSFER_CHUNK_BYTES=8192,
             PREPARE_SLICES_FROM_ARCHIVE=False,
         )
@@ -156,6 +157,49 @@ class PipelineTests(unittest.TestCase):
         with patch.object(pipeline, "RUN_NAME", "different_cap"), patch.object(pipeline, "MAX_REFERENCES_PER_ANCHOR", 20):
             with self.assertRaisesRegex(ValueError, "settings differ"):
                 pipeline.run_pipeline()
+
+    def test_uniform_time_setting_reaches_worker_and_reuses_existing_bank(self):
+        pipeline.run_pipeline()
+        bank_manifest = self.project / "artifacts/reference_banks/antisemitism_test/bank_manifest.json"
+        bank_digest = pipeline.file_digest(bank_manifest)
+        records = [make_record(1000 + index * 10, [f"Jewish fictional silver garden {index}."])
+                   for index in range(20)]
+        for index, record in enumerate(records):
+            record["posts"][0]["time"] = 1467331200 + (index // 10) * 86400
+        write_records(self.project / "discovery.ndjson", records)
+        with patch.multiple(pipeline, RUN_NAME="uniform_run", DISCOVERY_SAMPLING_METHOD="uniform_time", DISCOVERY_RANDOM_SEED=17):
+            output = pipeline.run_pipeline()
+            info, tables, _ = load_run(output)
+            settings = json.loads((output / "pipeline_settings.json").read_text())
+            self.assertEqual(settings["discovery_sampling_method"], "uniform_time")
+            self.assertEqual(settings["discovery_random_seed"], 17)
+            self.assertEqual(info["retrieval"]["sampling_method"], "uniform_time")
+            self.assertEqual(info["retrieval"]["sampling_random_seed"], 17)
+            self.assertEqual([row["selected_posts"] for row in info["retrieval"]["daily_counts"]], [2, 2])
+            self.assertEqual(len(tables["discovery_posts"]), 4)
+            self.assertTrue(settings["reference_bank_reused"])
+        self.assertEqual(self.client.reference_builds, 1)
+        self.assertEqual(pipeline.file_digest(bank_manifest), bank_digest)
+
+    def test_sampling_settings_fail_fast_and_check_does_not_scan(self):
+        for setting, value in [("DISCOVERY_SAMPLING_METHOD", "typo"), ("DISCOVERY_RANDOM_SEED", 1.5)]:
+            with self.subTest(setting=setting), patch.object(pipeline, setting, value):
+                with self.assertRaisesRegex(ValueError, "sampling"):
+                    pipeline.run_pipeline(check_only=True)
+        with patch.object(pipeline, "DISCOVERY_SAMPLING_METHOD", "uniform_time"), \
+             patch("utils.discovery._iter_eligible_posts", side_effect=AssertionError("Should not scan")):
+            pipeline.run_pipeline(check_only=True)
+        self.assertEqual(self.client.commands, [])
+        self.assertFalse((self.project / "artifacts").exists())
+
+    def test_resume_rejects_changed_sampling_settings(self):
+        checkpoint, _ = self.interrupt_upload()
+        command_count = len(self.client.commands)
+        for setting, value in [("DISCOVERY_SAMPLING_METHOD", "uniform_time"), ("DISCOVERY_RANDOM_SEED", 7)]:
+            with self.subTest(setting=setting), patch.object(pipeline, setting, value):
+                with self.assertRaisesRegex(ValueError, "Settings or source files changed"):
+                    pipeline.run_pipeline(resume=checkpoint)
+        self.assertEqual(len(self.client.commands), command_count)
 
     def test_failed_discovery_keeps_downloaded_bank_and_does_not_publish_run(self):
         self.client.fail_discovery = True

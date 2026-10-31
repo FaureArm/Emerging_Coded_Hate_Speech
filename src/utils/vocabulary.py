@@ -80,11 +80,11 @@ anchor_terms_by_hate_category = {
     },
     "islamophobia": {
         "muzat": ["muzat"],
-        "muzzies": ["muzzies"],
+        "muzzies": ["muzzies","muzzie"],
         "pislam": ["pislam"],
         "mohammedan": ["mohammedan"],
-        "mudslime": ["mudslime"],
-        "turk": ["turk"],
+        "mudslime": ["mudslime", "mudslimes", "mudslim"],
+        "turk": ["turk", "turks", "turkish"],
     },
     "anti_asian": {
         "slant eye": ["slant eye"],

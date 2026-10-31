@@ -35,6 +35,10 @@ def parse_arguments(arguments=None):
                         help="Encoded bank; defaults to artifacts/reference_banks/<category>_v1")
     parser.add_argument("--output", type=project_path, default=None)
     parser.add_argument("--max-posts", type=int, default=1000)
+    parser.add_argument("--sampling-method", choices=["first_matching", "uniform_time"], default="first_matching",
+                        help="First eligible posts, or balanced random samples across UTC days in the entire slice")
+    parser.add_argument("--sampling-random-seed", type=int, default=42,
+                        help="Reproducible discovery selection for uniform_time; ignored by first_matching")
     parser.add_argument("--batch-size", type=int, default=16, help="Candidate BERT window batch size")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parsed = parser.parse_args(arguments)
@@ -81,7 +85,7 @@ def run_experiment(arguments):
     import pandas as pd
     from utils.artifacts import save_discovery_run
     from utils.candidates import prepare_candidates
-    from utils.discovery import retrieve_discovery_posts
+    from utils.discovery import retrieve_discovery_posts, validate_discovery_sampling
     from utils.preprocessing import load_nlp_tools
     from utils.reference_bank import load_reference_bank, validate_discovery_bank
     from utils.reference_review import file_sha256
@@ -90,6 +94,7 @@ def run_experiment(arguments):
     category = arguments.category
     anchors, seed_words = vocabulary_for_category(category)
 
+    validate_discovery_sampling(arguments.sampling_method, arguments.sampling_random_seed)
     if arguments.max_posts < 1 or arguments.batch_size < 1:
         raise ValueError("--max-posts and --batch-size must be positive.")
     if arguments.output.exists():
@@ -119,7 +124,8 @@ def run_experiment(arguments):
     print("2/5: Retrieving independent discovery posts", flush=True)
     stage_started = perf_counter()
     posts, seed_summary, retrieval_info = retrieve_discovery_posts(
-        arguments.input, seed_words, reference_posts, arguments.max_posts
+        arguments.input, seed_words, reference_posts, arguments.max_posts,
+        sampling_method=arguments.sampling_method, sampling_random_seed=arguments.sampling_random_seed,
     )
     stage_times["retrieval"] = perf_counter() - stage_started
     print(f"Retrieved {len(posts):,} posts in {posts.thread_id.nunique():,} threads.", flush=True)
@@ -183,7 +189,8 @@ def run_experiment(arguments):
                       ("numpy", "pandas", "torch", "transformers", "tokenizers", "nltk", "scikit-learn", "emoji")},
                      **code_identity()},
         "limitations": [
-            "Consecutive historical source slice; retrieval is seed-conditioned and stops in file order",
+            "Consecutive historical source slice; retrieval remains seed-conditioned and limited to dates present in the slice",
+            retrieval_info["selection"],
             "Reference anchor matches are assumed suitable contexts, not validated hate labels",
             "Thread holdout is defined by this bank's selected source threads, not its entire sampling pool",
             "Normalized full-text equality excludes copies, not shared passages or paraphrases",
