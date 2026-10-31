@@ -40,6 +40,7 @@ DISCOVERY_SLICE_SIZE_GB = 10.0  # Following GB; only used when slice preparation
 # Example: keep REFERENCE_SOURCE and change DISCOVERY_SOURCE to raiders_next_3GB.ndjson.
 REFERENCE_SOURCE = "data/raiders/raiders_1GB.ndjson"
 DISCOVERY_SOURCE = "data/raiders/raiders_10GB.ndjson"
+SYNTHETIC_THREADS_SOURCE = None  # Set to "synthetic_threads.ndjson" to include synthetic posts.
 
 # None uses <category>_v1. Use a new name when reference/model settings change.
 # The old islamophobia_v3 bank contains antisemitism anchors; do not reuse it.
@@ -286,6 +287,12 @@ def validate_results(run_directory):
             or run_info["seed_words"] != seeds):
         raise ValueError("Downloaded run category, anchors or seeds do not match the selected vocabulary.")
     retrieval = run_info["retrieval"]
+    synthetic_info = retrieval.get("synthetic_source")
+    if (synthetic_info is None) != (SYNTHETIC_THREADS_SOURCE is None):
+        raise ValueError("Downloaded run synthetic input does not match the launcher setting.")
+    if synthetic_info is not None and synthetic_info["sha256"] != file_digest(
+            (PROJECT_ROOT / Path(SYNTHETIC_THREADS_SOURCE).expanduser()).resolve()):
+        raise ValueError("Downloaded run synthetic input differs from the local source.")
     expected_seed = DISCOVERY_RANDOM_SEED if DISCOVERY_SAMPLING_METHOD == "uniform_time" else None
     if (retrieval["sampling_method"] != DISCOVERY_SAMPLING_METHOD
             or retrieval["sampling_random_seed"] != expected_seed):
@@ -316,6 +323,9 @@ def configured_paths(saved_run_name=None, allow_existing_outputs=False):
         raise ValueError("MAX_REFERENCES_PER_ANCHOR must be positive or None.")
     if type(REFERENCE_RANDOM_SEED) is not int or type(CONTEXT_TOKENS_EACH_SIDE) is not int or CONTEXT_TOKENS_EACH_SIDE < 0:
         raise ValueError("Reference seed and context size must be integers; context size cannot be negative.")
+    if SYNTHETIC_THREADS_SOURCE is not None and (not isinstance(SYNTHETIC_THREADS_SOURCE, str)
+                                                or not SYNTHETIC_THREADS_SOURCE.strip()):
+        raise ValueError("SYNTHETIC_THREADS_SOURCE must be a path string or None.")
     executable = COLAB_EXECUTABLE or shutil.which("colab") or str(Path.home() / ".local/bin/colab")
     executable = shutil.which(str(Path(executable).expanduser()))
     if executable is None:
@@ -323,6 +333,8 @@ def configured_paths(saved_run_name=None, allow_existing_outputs=False):
     paths = {
         "reference_source": (PROJECT_ROOT / Path(REFERENCE_SOURCE).expanduser()).resolve(),
         "discovery_source": (PROJECT_ROOT / Path(DISCOVERY_SOURCE).expanduser()).resolve(),
+        "synthetic_source": ((PROJECT_ROOT / Path(SYNTHETIC_THREADS_SOURCE).expanduser()).resolve()
+                             if SYNTHETIC_THREADS_SOURCE is not None else None),
         "reference_version": reference_version,
         "reference_corpus": PROJECT_ROOT / "data/raiders/reference_corpora" / reference_version,
         "reference_bank": PROJECT_ROOT / "artifacts/reference_banks" / reference_version,
@@ -330,6 +342,11 @@ def configured_paths(saved_run_name=None, allow_existing_outputs=False):
         "run": PROJECT_ROOT / "artifacts" / run_name,
         "run_zip": PROJECT_ROOT / "artifacts" / f"{run_name}.zip",
     }
+    if paths["synthetic_source"] is not None:
+        if not paths["synthetic_source"].is_file() or paths["synthetic_source"].suffix != ".ndjson":
+            raise FileNotFoundError(f"Choose an existing synthetic NDJSON file: {paths['synthetic_source']}")
+        if paths["synthetic_source"] in {paths["reference_source"], paths["discovery_source"]}:
+            raise ValueError("Synthetic threads must be in their own NDJSON file.")
     if type(PREPARE_SLICES_FROM_ARCHIVE) is not bool:
         raise ValueError("PREPARE_SLICES_FROM_ARCHIVE must be True or False.")
     paths["slice_configuration"] = None
@@ -371,6 +388,7 @@ def configuration_snapshot(paths):
         "MAX_DISCOVERY_POSTS", "DISCOVERY_SAMPLING_METHOD", "DISCOVERY_RANDOM_SEED", "CANDIDATE_BATCH_SIZE", "RUN_NAME",
         "BERT_CHECKPOINT", "MODEL_REVISION", "CONTEXT_TOKENS_EACH_SIDE",
         "EXISTING_COLAB_SESSION", "COLAB_GPU", "TRANSFER_CHUNK_BYTES",
+        "SYNTHETIC_THREADS_SOURCE",
     )
     anchors, seed_words = vocabulary_for_category(HATE_CATEGORY)
     return {
@@ -381,7 +399,10 @@ def configuration_snapshot(paths):
             name: {"path": str(paths[name]), "bytes": paths[name].stat().st_size,
                    "mtime_ns": paths[name].stat().st_mtime_ns}
             for name in ("reference_source", "discovery_source")
-        },
+        } | ({"synthetic_source": {"path": str(paths["synthetic_source"]),
+                                    "bytes": paths["synthetic_source"].stat().st_size,
+                                    "mtime_ns": paths["synthetic_source"].stat().st_mtime_ns}}
+             if paths["synthetic_source"] is not None else {}),
         "slice_configuration": paths["slice_configuration"],
     }
 
@@ -407,6 +428,8 @@ def run_pipeline(check_only=False, resume=None):
     print(f"Reference source: {paths['reference_source']}")
     print(f"Discovery: up to {MAX_DISCOVERY_POSTS:,} matching posts from {paths['discovery_source']}")
     print(f"Discovery selection: {DISCOVERY_SAMPLING_METHOD}")
+    if paths["synthetic_source"] is not None:
+        print(f"Synthetic threads: {paths['synthetic_source']} (eligible posts reserve places in the cap)")
     if DISCOVERY_SAMPLING_METHOD == "uniform_time":
         print(f"Balance UTC days using seed {DISCOVERY_RANDOM_SEED}; two full scans on Colab before embedding selected posts.")
     print(f"Results: {paths['run']}")
@@ -458,7 +481,9 @@ def run_pipeline(check_only=False, resume=None):
     settings = {
         "slice_preparation": slice_manifest,
         "category": HATE_CATEGORY, "reference_version": paths["reference_version"], "reference_source": str(paths["reference_source"]),
-        "discovery_source": str(paths["discovery_source"]), "max_references_per_anchor": MAX_REFERENCES_PER_ANCHOR,
+        "discovery_source": str(paths["discovery_source"]),
+        "synthetic_source": str(paths["synthetic_source"]) if paths["synthetic_source"] is not None else None,
+        "max_references_per_anchor": MAX_REFERENCES_PER_ANCHOR,
         "reference_random_seed": REFERENCE_RANDOM_SEED, "seed_words": seed_words,
         "max_discovery_posts": MAX_DISCOVERY_POSTS, "candidate_batch_size": CANDIDATE_BATCH_SIZE,
         "discovery_sampling_method": DISCOVERY_SAMPLING_METHOD, "discovery_random_seed": DISCOVERY_RANDOM_SEED,
@@ -477,6 +502,8 @@ def run_pipeline(check_only=False, resume=None):
                 archive.write(source, source.relative_to(PROJECT_ROOT))
             archive.write(PROJECT_ROOT / "run_pipeline.py", "run_pipeline.py")
             archive.write(paths["discovery_source"], "inputs/discovery.ndjson")
+            if paths["synthetic_source"] is not None:
+                archive.write(paths["synthetic_source"], "inputs/synthetic_threads.ndjson")
             reference_folder = paths["reference_bank"] if reuse_bank else paths["reference_corpus"]
             remote_folder = "reference_bank" if reuse_bank else "reference_corpus"
             for source in sorted(reference_folder.iterdir()):
@@ -563,6 +590,8 @@ if not Path({str(remote_bank) + '.zip'!r}).is_file():
                          "--sampling-method", settings["discovery_sampling_method"],
                          "--sampling-random-seed", str(settings["discovery_random_seed"]),
                          "--device", "cuda", "--category", settings["category"]]
+            if settings["synthetic_source"] is not None:
+                arguments.extend(["--synthetic-input", str(remote_workspace / "inputs/synthetic_threads.ndjson")])
             client.execute(f'''from pathlib import Path
 import subprocess
 if not Path({str(remote_run / 'run_info.json')!r}).is_file():

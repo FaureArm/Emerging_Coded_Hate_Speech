@@ -81,7 +81,7 @@ def _allocate_daily_quotas(eligible_counts, maximum_posts, random_generator):
     return daily_quotas
 
 
-def _iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info):
+def _iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info, post_source="4chan"):
     """Stream validated seed matches; fill scan_info even when the caller stops early."""
     reference_thread_ids = set(reference_posts["thread_id"])
     reference_post_ids = set(reference_posts["post_id"])
@@ -106,6 +106,9 @@ def _iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info)
                 if not isinstance(record, dict) or not isinstance(record.get("posts"), list):
                     raise ValueError(f"Expected a posts list at source line {line_number}")
                 raw_posts = record["posts"]
+                target_term = record.get("target_term") if post_source == "synthetic" else None
+                if target_term is not None and (not isinstance(target_term, str) or not target_term.strip()):
+                    raise ValueError(f"Invalid synthetic target_term at source line {line_number}")
                 if any(not isinstance(post, dict) for post in raw_posts):
                     raise ValueError(f"Invalid post at source line {line_number}")
                 openers = [post for post in raw_posts if post.get("resto") == 0]
@@ -146,13 +149,17 @@ def _iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info)
                     if not matched_seeds:
                         continue
                     statistics["seed_matched_posts"] += 1
-                    yield {
-                        "post_id": post_id, "thread_id": thread_id, "board": "pol", "source": "4chan",
-                        "post_key": f"4chan:pol:{post_id}", "thread_key": f"4chan:pol:{thread_id}",
+                    selected_post = {
+                        "post_id": post_id, "thread_id": thread_id, "board": "pol", "source": post_source,
+                        "post_key": f"{post_source}:pol:{post_id}",
+                        "thread_key": f"{post_source}:pol:{thread_id}",
                         "source_line": line_number, "timestamp": raw_post.get("time"),
                         "text": post_text, "normalized_text_sha256": text_hash,
                         "matched_seeds": matched_seeds, "raw_post": raw_post,
                     }
+                    if post_source == "synthetic":
+                        selected_post["synthetic_target_term"] = target_term
+                    yield selected_post
     finally:
         if (source_path.stat().st_size, source_path.stat().st_mtime_ns) != (source_stat.st_size, source_stat.st_mtime_ns):
             raise ValueError("Source file changed during retrieval.")
@@ -162,7 +169,8 @@ def _iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info)
 
 
 def retrieve_discovery_posts(source_path, seed_words, reference_posts, maximum_posts=1000,
-                             sampling_method="first_matching", sampling_random_seed=42):
+                             sampling_method="first_matching", sampling_random_seed=42,
+                             synthetic_source_path=None):
     """Select seed matches after excluding fixed-bank threads and copied reference text.
 
     first_matching stops at the cap. uniform_time reads the full slice twice:
@@ -181,12 +189,43 @@ def retrieve_discovery_posts(source_path, seed_words, reference_posts, maximum_p
     validate_reference_posts(reference_posts)
     source_stat = source_path.stat()
     seed_patterns = {word: compile_phrase_pattern(word) for word in dict.fromkeys(seed_words)}
+    synthetic_posts = []
+    synthetic_info = None
+    if synthetic_source_path is not None:
+        synthetic_source_path = Path(synthetic_source_path)
+        if synthetic_source_path.resolve() == source_path.resolve():
+            raise ValueError("Synthetic and discovery sources must be different files.")
+        if synthetic_source_path.suffix != ".ndjson" or not synthetic_source_path.is_file():
+            raise FileNotFoundError(f"Expected a synthetic NDJSON file: {synthetic_source_path}")
+        synthetic_scan = {}
+        with closing(_iter_eligible_posts(synthetic_source_path, seed_patterns, reference_posts,
+                                          synthetic_scan, post_source="synthetic")) as eligible_posts:
+            for post in eligible_posts:
+                _post_utc_day(post)  # Selected synthetic posts need valid source timestamps.
+                synthetic_posts.append(post)
+        if synthetic_scan["counts"]["reference_threads_excluded"]:
+            raise ValueError("A synthetic thread ID overlaps a saved reference thread.")
+        if len(synthetic_posts) >= maximum_posts:
+            raise ValueError("Eligible synthetic posts fill the discovery cap. Increase MAX_DISCOVERY_POSTS.")
+        synthetic_scan["counts"].update(
+            selected_posts=len(synthetic_posts),
+            selected_threads=len({post["thread_id"] for post in synthetic_posts}),
+        )
+        synthetic_info = {
+            "path": str(synthetic_source_path.resolve()),
+            "bytes": synthetic_source_path.stat().st_size,
+            "sha256": synthetic_scan["consumed_prefix_sha256"],
+            "counts": synthetic_scan["counts"],
+            "selected_posts": len(synthetic_posts),
+            "selected_threads": len({post["thread_id"] for post in synthetic_posts}),
+        }
+    maximum_real_posts = maximum_posts - len(synthetic_posts)
     scan_info = {}
     daily_counts = []
     if sampling_method == "first_matching":
         with closing(_iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info)) as eligible_posts:
-            selected_posts = list(islice(eligible_posts, maximum_posts))
-        stop_reason = "maximum_posts" if len(selected_posts) == maximum_posts else "end_of_file"
+            real_posts = list(islice(eligible_posts, maximum_real_posts))
+        stop_reason = "maximum_posts" if len(real_posts) == maximum_real_posts else "end_of_file"
         selection = "First matching posts in source order, after reference exclusions; not random sampling"
     else:
         print("Time sampling 1/2: counting eligible posts by UTC day across the full discovery slice.", flush=True)
@@ -194,14 +233,14 @@ def retrieve_discovery_posts(source_path, seed_words, reference_posts, maximum_p
         with closing(_iter_eligible_posts(source_path, seed_patterns, reference_posts, scan_info)) as eligible_posts:
             for post in eligible_posts:
                 eligible_counts[_post_utc_day(post)] += 1
-        if not eligible_counts:
+        if not eligible_counts and not synthetic_posts:
             raise ValueError(f"No discovery posts survived retrieval and separation. Counts: {scan_info['counts']}")
         random_generator = random.Random(sampling_random_seed)
-        daily_quotas = _allocate_daily_quotas(eligible_counts, maximum_posts, random_generator)
+        daily_quotas = _allocate_daily_quotas(eligible_counts, maximum_real_posts, random_generator)
         daily_reservoirs = {day: [] for day in daily_quotas}
         daily_posts_seen = Counter()
         second_scan_info = {}
-        print(f"Time sampling 2/2: selecting up to {maximum_posts:,} posts across {len(daily_quotas):,} UTC days.", flush=True)
+        print(f"Time sampling 2/2: selecting up to {maximum_real_posts:,} real posts across {len(daily_quotas):,} UTC days.", flush=True)
         with closing(_iter_eligible_posts(source_path, seed_patterns, reference_posts, second_scan_info)) as eligible_posts:
             for source_position, post in enumerate(eligible_posts):
                 day = _post_utc_day(post)
@@ -219,7 +258,7 @@ def retrieve_discovery_posts(source_path, seed_words, reference_posts, maximum_p
         if scan_info != second_scan_info or eligible_counts != daily_posts_seen:
             raise ValueError("Source file changed between time-sampling passes.")
         # Restore source order so random reservoir slots do not affect later stages.
-        selected_posts = [post for _, post in sorted(
+        real_posts = [post for _, post in sorted(
             (entry for reservoir in daily_reservoirs.values() for entry in reservoir),
             key=lambda entry: entry[0],
         )]
@@ -232,6 +271,9 @@ def retrieve_discovery_posts(source_path, seed_words, reference_posts, maximum_p
                      "random posts within each day; sparse-day capacity redistributed; source order retained")
     if (source_path.stat().st_size, source_path.stat().st_mtime_ns) != (source_stat.st_size, source_stat.st_mtime_ns):
         raise ValueError("Source file changed during retrieval.")
+    if {post["post_id"] for post in real_posts} & {post["post_id"] for post in synthetic_posts}:
+        raise ValueError("A synthetic post ID overlaps a selected real post ID. Use unique high positive IDs.")
+    selected_posts = real_posts + synthetic_posts
     if not selected_posts:
         raise ValueError(f"No discovery posts survived retrieval and separation. Counts: {scan_info['counts']}")
     posts = pd.DataFrame(selected_posts).set_index("post_id", drop=False)
@@ -243,10 +285,12 @@ def retrieve_discovery_posts(source_path, seed_words, reference_posts, maximum_p
         "sampling_random_seed": sampling_random_seed if sampling_method == "uniform_time" else None,
         "scan_passes": 2 if sampling_method == "uniform_time" else 1,
         "time_bin": "UTC calendar day" if sampling_method == "uniform_time" else None,
-        "daily_counts": daily_counts,
+        "daily_counts": daily_counts, "synthetic_source": synthetic_info,
+        "synthetic_inclusion": ("All eligible synthetic posts reserve places inside the cap; real posts fill the remainder"
+                                if synthetic_info is not None else None),
         "separation": "Exclude every thread represented in the fixed bank; then exclude normalized reference text",
         "reference_thread_count": int(reference_posts["thread_id"].nunique()), "split_random_seed": None,
-        "source_identity": "4chan board + original post/thread ID; this reader is restricted to pol",
+        "source_identity": "Source namespace + pol board + post/thread ID; synthetic IDs must not overlap selected real IDs",
         "parser_sha256": parser_hash(),
     }
     selected_seed_counts = Counter(seed for post in selected_posts for seed in post["matched_seeds"])

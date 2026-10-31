@@ -201,6 +201,40 @@ class PipelineTests(unittest.TestCase):
                     pipeline.run_pipeline(resume=checkpoint)
         self.assertEqual(len(self.client.commands), command_count)
 
+    def test_synthetic_threads_are_packaged_and_reach_saved_artifacts(self):
+        synthetic = self.project / "synthetic_threads.ndjson"
+        write_records(synthetic, [{"target_term": "moonquartz", "posts": [
+            {"no": 9000000000001, "resto": 0, "time": 1467500000,
+             "com": "Jewish moonquartz signal in a fictional post."},
+            {"no": 9000000000002, "resto": 9000000000001, "time": 1467500001,
+             "com": "Jewish moonquartz spread in the fictional thread."},
+        ]}])
+        with patch.object(pipeline, "SYNTHETIC_THREADS_SOURCE", "synthetic_threads.ndjson"):
+            output = pipeline.run_pipeline()
+            info, tables, _ = load_run(output)
+            settings = json.loads((output / "pipeline_settings.json").read_text())
+            self.assertEqual(settings["synthetic_source"], str(synthetic))
+            self.assertEqual(info["retrieval"]["synthetic_source"]["selected_posts"], 2)
+            self.assertEqual(info["retrieval"]["counts"]["selected_posts"], 4)
+            self.assertEqual(tables["discovery_posts"].source.value_counts()["synthetic"], 2)
+            self.assertEqual(set(tables["discovery_posts"].loc[
+                tables["discovery_posts"].source.eq("synthetic"), "synthetic_target_term"
+            ]), {"moonquartz"})
+            self.assertIn("moonquartz", set(tables["tfidf_candidates"].candidate))
+            self.assertTrue((output / "candidate_stage_counts.json").is_file())
+        self.assertEqual(self.client.discovery_runs, 1)
+
+    def test_synthetic_file_change_rejects_resume(self):
+        synthetic = self.project / "synthetic_threads.ndjson"
+        synthetic.write_text("")
+        with patch.object(pipeline, "SYNTHETIC_THREADS_SOURCE", "synthetic_threads.ndjson"):
+            checkpoint, _ = self.interrupt_upload()
+            command_count = len(self.client.commands)
+            synthetic.write_text("{}\\n")
+            with self.assertRaisesRegex(ValueError, "Settings or source files changed"):
+                pipeline.run_pipeline(resume=checkpoint)
+            self.assertEqual(len(self.client.commands), command_count)
+
     def test_failed_discovery_keeps_downloaded_bank_and_does_not_publish_run(self):
         self.client.fail_discovery = True
         with self.assertRaisesRegex(RuntimeError, "Simulated remote"):

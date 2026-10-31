@@ -29,6 +29,7 @@ The launcher uses your installed, authenticated Colab CLI; it detects `colab` on
 | `HATE_CATEGORY` / `--category` | Category key used to select both seeds and anchors from `vocabulary.py` |
 | `REFERENCE_SOURCE` | Reference NDJSON input, or output path when automatic slicing is enabled |
 | `DISCOVERY_SOURCE` | Discovery NDJSON input/output path; must differ from the reference path when automatic slicing is enabled |
+| SYNTHETIC_THREADS_SOURCE | None disables injection; set to "synthetic_threads.ndjson" to include eligible synthetic posts |
 | `PREPARE_SLICES_FROM_ARCHIVE` | `False` keeps using existing files; `True` creates/verifies consecutive slices before reference preparation |
 | `RAW_ARCHIVE_PATH`, `RAW_ARCHIVE_MEMBER` | Full compressed Raiders archive and its NDJSON member name |
 | `REFERENCE_SLICE_SIZE_GB`, `DISCOVERY_SLICE_SIZE_GB` | Maximum uncompressed decimal GB for the reference prefix and following discovery slice |
@@ -90,6 +91,20 @@ Each experiment also contains `pipeline_settings.json` and a copy of the launche
 Open **`src/Results.ipynb`** and set `RUN_DIRECTORY` to the path printed by the launcher. It reads saved tables locally, without BERT, downloads or the reference bank. Existing notebook outputs are left untouched.
 
 For another experiment, change the discovery settings and use a new `RUN_NAME` (or keep `None`). Keep the same category and reference settings/version to reuse the bank. To use the earlier antisemitism v1 bank, select `antisemitism` and set **both** `REFERENCE_VERSION = "antisemitism_v1"` and `MAX_REFERENCES_PER_ANCHOR = 15`.
+
+### Test synthetic coded terms
+
+The repository contains an empty synthetic_threads.ndjson file. Fill it with **one JSON object per line**, using the same posts structure as the Raiders source. You may add a target_term string to label the invented expression for later inspection. For example:
+
+~~~json
+{"target_term":"moonquartz","posts":[{"no":9000000000001,"resto":0,"time":1467331200,"com":"Muslim moonquartz message in a fictional post."},{"no":9000000000002,"resto":9000000000001,"time":1467331260,"com":"Another fictional Muslim moonquartz message."}]}
+~~~
+
+Each no is a unique positive post ID. The opener's resto is 0, and each reply's resto is the opener ID. time is a positive Unix timestamp in seconds. com contains text or HTML. Use IDs well outside the real corpus range, and keep IDs unique across synthetic threads. The optional target_term is saved with selected posts as synthetic_target_term; it does not affect retrieval or scoring. The example uses an Islamophobia retrieval seed (Muslim). For another category, use one of that category's seeds from src/utils/vocabulary.py in **each post you want selected**.
+
+Set SYNTHETIC_THREADS_SOURCE = "synthetic_threads.ndjson" at the top of run_pipeline.py. The launcher packages this small file separately from the discovery slice. Its --check mode validates the path. The worker applies the usual seed matching, readable-text parser and reference exclusions. Every eligible synthetic post is included, with places reserved within MAX_DISCOVERY_POSTS; the remaining places use real posts according to DISCOVERY_SAMPLING_METHOD. Increase the cap if eligible synthetic posts would fill it. Synthetic posts enter the same candidate extraction, TF-IDF, embeddings and scoring stages. Their saved source and post_key/thread_key identify them as synthetic.
+
+run_info.json records the synthetic file hash, retrieval counts and selected-post count; discovery_posts.csv preserves the target label. A changed synthetic file requires a new run name and cannot be used to resume an interrupted run. Set the setting back to None for a comparable real-only run using the same reference bank. The synthetic injection is a controlled experiment: inspect whether the target survives candidate extraction and where it ranks, while keeping its generated origin explicit. Generate varied contexts across several independent threads, and include neutral uses of the same invented term as controls.
 
 ### Choose how discovery posts are selected
 

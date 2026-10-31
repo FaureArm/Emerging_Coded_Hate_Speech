@@ -34,6 +34,8 @@ def parse_arguments(arguments=None):
     parser.add_argument("--reference-bank", type=project_path, default=None,
                         help="Encoded bank; defaults to artifacts/reference_banks/<category>_v1")
     parser.add_argument("--output", type=project_path, default=None)
+    parser.add_argument("--synthetic-input", type=project_path, default=None,
+                        help="Optional separate NDJSON file of synthetic Raiders threads")
     parser.add_argument("--max-posts", type=int, default=1000)
     parser.add_argument("--sampling-method", choices=["first_matching", "uniform_time"], default="first_matching",
                         help="First eligible posts, or balanced random samples across UTC days in the entire slice")
@@ -126,6 +128,7 @@ def run_experiment(arguments):
     posts, seed_summary, retrieval_info = retrieve_discovery_posts(
         arguments.input, seed_words, reference_posts, arguments.max_posts,
         sampling_method=arguments.sampling_method, sampling_random_seed=arguments.sampling_random_seed,
+        synthetic_source_path=arguments.synthetic_input,
     )
     stage_times["retrieval"] = perf_counter() - stage_started
     print(f"Retrieved {len(posts):,} posts in {posts.thread_id.nunique():,} threads.", flush=True)
@@ -189,7 +192,9 @@ def run_experiment(arguments):
                       ("numpy", "pandas", "torch", "transformers", "tokenizers", "nltk", "scikit-learn", "emoji")},
                      **code_identity()},
         "limitations": [
-            "Consecutive historical source slice; retrieval remains seed-conditioned and limited to dates present in the slice",
+            ("Real discovery posts are limited to dates in the historical slice; synthetic posts have user-supplied dates"
+             if arguments.synthetic_input is not None else
+             "Consecutive historical source slice; retrieval remains seed-conditioned and limited to dates present in the slice"),
             retrieval_info["selection"],
             "Reference anchor matches are assumed suitable contexts, not validated hate labels",
             "Thread holdout is defined by this bank's selected source threads, not its entire sampling pool",

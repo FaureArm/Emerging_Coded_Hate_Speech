@@ -172,6 +172,72 @@ class ReproductionTests(unittest.TestCase):
         self.assertIsNone(compile_phrase_pattern("jew").search("jewellery"))
         self.assertIsNotNone(compile_phrase_pattern("great replacement").search("great \n replacement"))
 
+    def test_synthetic_threads_reserve_cap_and_keep_provenance(self):
+        source = self.directory / "real.ndjson"
+        synthetic = self.directory / "synthetic.ndjson"
+        write_records(source, [make_record(900, ["jewish real context"]),
+                               make_record(910, ["jewish later context"])])
+        records = [
+            {"target_term": "moonquartz", "posts": [
+                {"no": 9000000000001, "resto": 0, "time": 1467500000,
+                 "com": "Jewish moonquartz signal in context."},
+                {"no": 9000000000002, "resto": 9000000000001, "time": 1467500001,
+                 "com": "Jewish moonquartz appeared again."},
+                {"no": 9000000000003, "resto": 9000000000001, "time": 1467500002,
+                 "com": "Moonquartz alone has no seed."},
+            ]},
+        ]
+        write_records(synthetic, records)
+        for method in ("first_matching", "uniform_time"):
+            with self.subTest(method=method):
+                posts, summary, info = retrieve_discovery_posts(
+                    source, ["jewish"], self.reference_posts, 3,
+                    sampling_method=method, synthetic_source_path=synthetic,
+                )
+                self.assertEqual(len(posts), 3)
+                self.assertEqual(sum(posts.source.eq("synthetic")), 2)
+                self.assertTrue({9000000000001, 9000000000002}.issubset(set(posts.post_id)))
+                self.assertEqual(len(set(posts.post_id) & {900, 910}), 1)
+                self.assertEqual(posts.loc[9000000000001, "post_key"], "synthetic:pol:9000000000001")
+                self.assertEqual(posts.loc[9000000000002, "thread_key"], "synthetic:pol:9000000000001")
+                self.assertEqual(posts.loc[9000000000001, "synthetic_target_term"], "moonquartz")
+                self.assertEqual(summary.selected_posts.tolist(), [3])
+                self.assertEqual(info["counts"]["selected_posts"], 3)
+                self.assertEqual(info["synthetic_source"]["selected_posts"], 2)
+                self.assertEqual(info["synthetic_source"]["counts"]["seed_matched_posts"], 2)
+                self.assertEqual(info["synthetic_source"]["sha256"], sha256(synthetic.read_bytes()).hexdigest())
+                json.dumps(info)
+
+    def test_synthetic_input_validates_cap_ids_and_timestamps(self):
+        source = self.directory / "real.ndjson"
+        synthetic = self.directory / "synthetic.ndjson"
+        write_records(source, [make_record(900, ["jewish real context"])])
+        post = {"no": 9000000000001, "resto": 0, "time": 1467500000,
+                "com": "Jewish moonquartz context"}
+        write_records(synthetic, [{"posts": [post]}])
+        with self.assertRaisesRegex(ValueError, "fill the discovery cap"):
+            retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 1,
+                                     synthetic_source_path=synthetic)
+        post["no"] = 900
+        write_records(synthetic, [{"posts": [post]}])
+        with self.assertRaisesRegex(ValueError, "overlaps a selected real post"):
+            retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2,
+                                     synthetic_source_path=synthetic)
+        post["no"] = 9000000000001
+        post["time"] = None
+        write_records(synthetic, [{"posts": [post]}])
+        with self.assertRaisesRegex(ValueError, "timestamp"):
+            retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2,
+                                     synthetic_source_path=synthetic)
+        post["time"] = 1467500000
+        write_records(synthetic, [{"target_term": "", "posts": [post]}])
+        with self.assertRaisesRegex(ValueError, "target_term"):
+            retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2,
+                                     synthetic_source_path=synthetic)
+        with self.assertRaisesRegex(ValueError, "different files"):
+            retrieve_discovery_posts(source, ["jewish"], self.reference_posts, 2,
+                                     synthetic_source_path=source)
+
     def dated_discovery_source(self, counts_by_day):
         records = []
         for day_offset, count in enumerate(counts_by_day):
@@ -384,7 +450,8 @@ class ReproductionTests(unittest.TestCase):
         output = self.directory / "run"
         arguments = SimpleNamespace(category="antisemitism", input=source, reference_bank=self.bank, output=output,
                                     max_posts=4, batch_size=16, device="cpu",
-                                    sampling_method="first_matching", sampling_random_seed=42)
+                                    sampling_method="first_matching", sampling_random_seed=42,
+                                    synthetic_input=None)
         bank_checksums = {path.name: sha256(path.read_bytes()).hexdigest() for path in self.bank.iterdir()}
         with patch("utils.preprocessing.load_nlp_tools", return_value=({"after", "the", "and"}, PunktSentenceTokenizer(), NLTKWordTokenizer())), \
              patch("nltk.pos_tag", side_effect=lambda words: [(word, "NN") for word in words]), \
