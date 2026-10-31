@@ -43,15 +43,23 @@ DISCOVERY_SOURCE = "data/raiders/raiders_10GB.ndjson"
 
 # None uses <category>_v1. Use a new name when reference/model settings change.
 # The old islamophobia_v3 bank contains antisemitism anchors; do not reuse it.
-REFERENCE_VERSION = None
+REFERENCE_VERSION = "islamophobia_v4"
 MAX_REFERENCES_PER_ANCHOR = 100  # None keeps all eligible distinct contexts.
 REFERENCE_RANDOM_SEED = 42
 
 MAX_DISCOVERY_POSTS = 10000
-DISCOVERY_SAMPLING_METHOD = "first_matching"  # Or "uniform_time": balance eligible posts across UTC days.
+DISCOVERY_SAMPLING_METHOD = "uniform_time"  # "first_matching" Or "uniform_time": balance eligible posts across UTC days.
 DISCOVERY_RANDOM_SEED = 42  # Used only by uniform_time; independent of reference selection.
 CANDIDATE_BATCH_SIZE = 16
 RUN_NAME = None  # None creates a unique timestamped name; otherwise use a new name.
+
+# Independent conversational extensions. Keep all False for the HMApp baseline.
+USE_CONVERSATION_EMBEDDINGS = False
+USE_AUDIENCE_UPTAKE = False
+USE_REPLY_REACTIONS = False
+CONVERSATION_CONTEXT_TOKENS = 48
+AUDIENCE_UPTAKE_WEIGHT = 0.10
+REPLY_REACTION_WEIGHT = 0.05
 
 BERT_CHECKPOINT = "google-bert/bert-base-uncased"
 MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"  # Same revision as your first run.
@@ -290,6 +298,14 @@ def validate_results(run_directory):
     if (retrieval["sampling_method"] != DISCOVERY_SAMPLING_METHOD
             or retrieval["sampling_random_seed"] != expected_seed):
         raise ValueError("Downloaded run discovery sampling settings do not match the launcher.")
+    conversation = run_info.get("conversation", {})
+    if (conversation.get("embedding_enabled") != USE_CONVERSATION_EMBEDDINGS
+            or conversation.get("audience_uptake_enabled") != USE_AUDIENCE_UPTAKE
+            or conversation.get("reply_reactions_enabled") != USE_REPLY_REACTIONS
+            or conversation.get("context_tokens") != CONVERSATION_CONTEXT_TOKENS
+            or conversation.get("uptake_weight") != AUDIENCE_UPTAKE_WEIGHT
+            or conversation.get("reaction_weight") != REPLY_REACTION_WEIGHT):
+        raise ValueError("Downloaded run conversational settings do not match the launcher.")
     for name, expected in run_info["artifact_checksums"].items():
         if Path(name).name != name or file_digest(run_directory / name) != expected:
             raise ValueError(f"Invalid downloaded artifact: {name}")
@@ -316,6 +332,16 @@ def configured_paths(saved_run_name=None, allow_existing_outputs=False):
         raise ValueError("MAX_REFERENCES_PER_ANCHOR must be positive or None.")
     if type(REFERENCE_RANDOM_SEED) is not int or type(CONTEXT_TOKENS_EACH_SIDE) is not int or CONTEXT_TOKENS_EACH_SIDE < 0:
         raise ValueError("Reference seed and context size must be integers; context size cannot be negative.")
+    for name in ("USE_CONVERSATION_EMBEDDINGS", "USE_AUDIENCE_UPTAKE", "USE_REPLY_REACTIONS"):
+        if type(globals()[name]) is not bool:
+            raise ValueError(f"{name} must be True or False.")
+    if type(CONVERSATION_CONTEXT_TOKENS) is not int or not 0 <= CONVERSATION_CONTEXT_TOKENS <= 256:
+        raise ValueError("CONVERSATION_CONTEXT_TOKENS must be an integer from 0 to 256.")
+    if USE_CONVERSATION_EMBEDDINGS and CONVERSATION_CONTEXT_TOKENS == 0:
+        raise ValueError("Conversation embeddings need at least one context token.")
+    for name in ("AUDIENCE_UPTAKE_WEIGHT", "REPLY_REACTION_WEIGHT"):
+        if type(globals()[name]) not in (int, float) or not 0 <= globals()[name] <= 1:
+            raise ValueError(f"{name} must be a number from 0 to 1.")
     executable = COLAB_EXECUTABLE or shutil.which("colab") or str(Path.home() / ".local/bin/colab")
     executable = shutil.which(str(Path(executable).expanduser()))
     if executable is None:
@@ -370,6 +396,8 @@ def configuration_snapshot(paths):
         "HATE_CATEGORY", "REFERENCE_VERSION", "MAX_REFERENCES_PER_ANCHOR", "REFERENCE_RANDOM_SEED",
         "MAX_DISCOVERY_POSTS", "DISCOVERY_SAMPLING_METHOD", "DISCOVERY_RANDOM_SEED", "CANDIDATE_BATCH_SIZE", "RUN_NAME",
         "BERT_CHECKPOINT", "MODEL_REVISION", "CONTEXT_TOKENS_EACH_SIDE",
+        "USE_CONVERSATION_EMBEDDINGS", "USE_AUDIENCE_UPTAKE", "USE_REPLY_REACTIONS",
+        "CONVERSATION_CONTEXT_TOKENS", "AUDIENCE_UPTAKE_WEIGHT", "REPLY_REACTION_WEIGHT",
         "EXISTING_COLAB_SESSION", "COLAB_GPU", "TRANSFER_CHUNK_BYTES",
     )
     anchors, seed_words = vocabulary_for_category(HATE_CATEGORY)
@@ -407,6 +435,8 @@ def run_pipeline(check_only=False, resume=None):
     print(f"Reference source: {paths['reference_source']}")
     print(f"Discovery: up to {MAX_DISCOVERY_POSTS:,} matching posts from {paths['discovery_source']}")
     print(f"Discovery selection: {DISCOVERY_SAMPLING_METHOD}")
+    print(f"Conversation embeddings: {USE_CONVERSATION_EMBEDDINGS}; "
+          f"audience uptake: {USE_AUDIENCE_UPTAKE}; reply reactions: {USE_REPLY_REACTIONS}")
     if DISCOVERY_SAMPLING_METHOD == "uniform_time":
         print(f"Balance UTC days using seed {DISCOVERY_RANDOM_SEED}; two full scans on Colab before embedding selected posts.")
     print(f"Results: {paths['run']}")
@@ -464,6 +494,10 @@ def run_pipeline(check_only=False, resume=None):
         "discovery_sampling_method": DISCOVERY_SAMPLING_METHOD, "discovery_random_seed": DISCOVERY_RANDOM_SEED,
         "bert_checkpoint": BERT_CHECKPOINT, "model_revision": MODEL_REVISION,
         "context_tokens_each_side": CONTEXT_TOKENS_EACH_SIDE, "reference_bank_reused": reuse_bank,
+        "conversation_embeddings": USE_CONVERSATION_EMBEDDINGS,
+        "audience_uptake": USE_AUDIENCE_UPTAKE, "reply_reactions": USE_REPLY_REACTIONS,
+        "conversation_context_tokens": CONVERSATION_CONTEXT_TOKENS,
+        "uptake_weight": AUDIENCE_UPTAKE_WEIGHT, "reaction_weight": REPLY_REACTION_WEIGHT,
         "run_name": paths["run"].name, "colab_session": session_name,
         "requested_gpu": COLAB_GPU if not EXISTING_COLAB_SESSION else None,
     }
@@ -562,7 +596,16 @@ if not Path({str(remote_bank) + '.zip'!r}).is_file():
                          "--max-posts", str(MAX_DISCOVERY_POSTS), "--batch-size", str(CANDIDATE_BATCH_SIZE),
                          "--sampling-method", settings["discovery_sampling_method"],
                          "--sampling-random-seed", str(settings["discovery_random_seed"]),
-                         "--device", "cuda", "--category", settings["category"]]
+                         "--device", "cuda", "--category", settings["category"],
+                         "--conversation-context-tokens", str(settings["conversation_context_tokens"]),
+                         "--uptake-weight", str(settings["uptake_weight"]),
+                         "--reaction-weight", str(settings["reaction_weight"])]
+            if settings["conversation_embeddings"]:
+                arguments.append("--conversation-embeddings")
+            if settings["audience_uptake"]:
+                arguments.append("--audience-uptake")
+            if settings["reply_reactions"]:
+                arguments.append("--reply-reactions")
             client.execute(f'''from pathlib import Path
 import subprocess
 if not Path({str(remote_run / 'run_info.json')!r}).is_file():

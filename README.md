@@ -36,9 +36,14 @@ The launcher uses your installed, authenticated Colab CLI; it detects `colab` on
 | `MAX_REFERENCES_PER_ANCHOR` | Maximum distinct contexts per anchor; `None` removes the cap |
 | `REFERENCE_RANDOM_SEED` | Reproducible selection of reference contexts |
 | `MAX_DISCOVERY_POSTS` | Maximum eligible seed-matching posts processed, not the number of raw posts scanned |
-| `DISCOVERY_SAMPLING_METHOD` | `"first_matching"` (default) stops at the cap; `"uniform_time"` balances matches across UTC days in the full discovery slice |
+| `DISCOVERY_SAMPLING_METHOD` | `"first_matching"` stops at the cap; current `"uniform_time"` setting balances matches across UTC days in the full discovery slice |
 | `DISCOVERY_RANDOM_SEED` | Reproducible discovery sampling for `"uniform_time"`; independent of `REFERENCE_RANDOM_SEED` |
 | `CANDIDATE_BATCH_SIZE` | Candidate embedding batch size on the GPU |
+| `USE_CONVERSATION_EMBEDDINGS` | Add earlier opener/explicit-parent text to candidate BERT windows |
+| `USE_AUDIENCE_UPTAKE` | Rerank with later unquoted uses of a candidate in selected threads |
+| `USE_REPLY_REACTIONS` | Rerank with exploratory keyword cues in explicit replies |
+| `CONVERSATION_CONTEXT_TOKENS` | Maximum additional BERT tokens from opener/parent, default 48 |
+| `AUDIENCE_UPTAKE_WEIGHT`, `REPLY_REACTION_WEIGHT` | Additive experimental-score weights, default 0.10 and 0.05 |
 | `RUN_NAME` | New experiment name; `None` generates a unique timestamped name |
 | `BERT_CHECKPOINT`, `MODEL_REVISION`, `CONTEXT_TOKENS_EACH_SIDE` | Reference and candidate embedding settings; defaults retain the first completed run's model revision and 64 surrounding subwords per side |
 | `EXISTING_COLAB_SESSION` | `None` creates a fresh session; set a name such as `"hmapp"` to reuse an existing session |
@@ -48,7 +53,7 @@ The launcher uses your installed, authenticated Colab CLI; it detects `colab` on
 | `TRANSFER_TIMEOUT_SECONDS` | Time limit per transfer attempt, default 180 seconds |
 | `TRANSFER_RETRY_DELAY_SECONDS` | Initial retry delay, default 5 seconds; doubles up to 60 seconds |
 
-The current selection is **`islamophobia`, up to 100 contexts per anchor, random seed 42**, using the new `islamophobia_v1` reference version. The older directory named `islamophobia_v3` was built with antisemitism anchors and cannot be reused for an Islamophobia experiment. Existing saved references are checked against the selected category and anchor dictionary before Colab starts. Earlier completed results are preserved; correcting the category requires a newly built bank and a fresh discovery run. Raising the reference cap cannot create contexts absent from the source.
+The current selection is **`islamophobia`, up to 100 contexts per anchor, random seed 42**, using `islamophobia_v4`. The older directory named `islamophobia_v3` was built with antisemitism anchors and cannot be reused for an Islamophobia experiment. Existing saved references are checked against the selected category and anchor dictionary before Colab starts. Earlier completed results are preserved; correcting the category requires a newly built bank and a fresh discovery run. Raising the reference cap cannot create contexts absent from the source.
 
 ### What happens automatically
 
@@ -88,6 +93,16 @@ Completed outputs are saved to:
 Each experiment also contains `pipeline_settings.json` and a copy of the launcher used, `pipeline_launcher.py`. The runner's `run_info.json` records the computational settings, model revision, source-code hashes and provenance.
 
 Open **`src/Results.ipynb`** and set `RUN_DIRECTORY` to the path printed by the launcher. It reads saved tables locally, without BERT, downloads or the reference bank. Existing notebook outputs are left untouched.
+
+### Conversational-context experiments
+
+Set any combination of the three `USE_...` switches at the top of `run_pipeline.py`; all are `False` by default. Use a fresh `RUN_NAME` for each run. For a clean ablation, run the all-off baseline, then enable one switch at a time with the same input, sampling seed, candidate cap, vocabulary and reference bank. The bank is reused. The launcher currently reruns candidate embeddings for each experiment, including social-only switches.
+
+Conversation embeddings prepend at most `CONVERSATION_CONTEXT_TOKENS` tokens from the thread opener and one explicitly linked earlier parent. Only candidate subwords are pooled; the candidate text and original occurrence offsets remain the same. An opener has no preceding context. Posts with no explicit parent use the opener alone. The reference bank stays frozen and post-only, so this experiment tests a candidate-side context addition rather than symmetric context encoding.
+
+Audience uptake looks through every post in each **selected thread**, including posts without seeds. It counts exact-phrase uses in non-quoted lines after the first observed use in that thread. This does not expand the candidate vocabulary or the seed-selected embedding pool. Reply reactions use only explicit `>>post_id` links to an earlier candidate-containing post. The present cues are literal moderation, laughter and pushback keywords; they are saved for inspection and are **not validated stance or hate labels**. The experimental reaction score uses the number of direct replies containing moderation or laughter cues; pushback counts are diagnostic only. Distinct posts cannot establish distinct authors on anonymous 4chan.
+
+`ranked_candidates.csv` retains HMApp's `relevance` and `original_rank`. When either social switch is on, it adds `uptake_score`, `reaction_score`, `experimental_score` and `experimental_rank`, plus raw evidence counts. Each enabled signal is `log1p(count)` divided by the largest such value in that run; disabled signals are zero. The experimental score adds the configured weights to relevance. Because normalization depends on the candidate pool, compare rankings within a run and use paired runs for ablations. `conversation_posts.csv` stores the selected threads' readable posts and explicit links; `social_evidence.csv` contains counts; `reply_reactions.csv` contains cue-bearing examples. Retrospective uptake/reaction scores use posts after the candidate occurrence, so they are for corpus analysis, not real-time prediction.
 
 For another experiment, change the discovery settings and use a new `RUN_NAME` (or keep `None`). Keep the same category and reference settings/version to reuse the bank. To use the earlier antisemitism v1 bank, select `antisemitism` and set **both** `REFERENCE_VERSION = "antisemitism_v1"` and `MAX_REFERENCES_PER_ANCHOR = 15`.
 
@@ -156,7 +171,7 @@ For the available starter corpus, the frozen holdout is **every entire thread re
 
 This is the smallest split compatible with the prepared bank. It does **not** reserve the entire 1 GB pool from which references were sampled: other threads in that pool remain eligible. A subsequent archive slice remains an optional alternative: set `DISCOVERY_SOURCE = "data/raiders/raiders_next_3GB.ndjson"` with `PREPARE_SLICES_FROM_ARCHIVE = True` in the launcher. Either input still undergoes the fixed-bank thread and text checks. The optional launcher step extracts slices locally before the remote discovery worker starts.
 
-Identity is `4chan:pol:<source id>` for posts and threads; the reader rejects reference banks from another board. Numeric IDs are original archive IDs, never reset DataFrame row numbers. Saved posts include thread identity, timestamp, matched seeds, raw source JSON and the exact readable text. `resto` is used only to verify thread membership; it is not treated as a direct reply parent. No conversation graph or context model is implemented.
+Identity is `4chan:pol:<source id>` for posts and threads; the reader rejects reference banks from another board. Numeric IDs are original archive IDs, never reset DataFrame row numbers. Saved posts include thread identity, timestamp, matched seeds, raw source JSON and the exact readable text. `resto` is used only to verify thread membership; it is not treated as a direct reply parent. When a conversational switch is enabled, explicit reply references are read from the original comment HTML.
 
 Reproducibility records include the consumed complete-line prefix SHA-256, source path/size, bank-manifest identifier, seeds, software versions, code hashes/Git status, random seed and timings. In `first_matching` mode, the untouched suffix is not read merely to hash the entire input. In `uniform_time` mode, the consumed-prefix hash covers the full slice, and both passes must match. Retain the original input and commit the source version used for a reported experiment.
 

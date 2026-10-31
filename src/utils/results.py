@@ -33,7 +33,10 @@ def bar_chart_html(values, title):
 def inspection_view(rankings, excluded_phrases=(), minimum_posts=1, minimum_threads=1):
     """Display filtering only; original scores, ranks and threshold flags stay unchanged."""
     excluded_pattern = phrase_pattern(excluded_phrases)
-    excluded = rankings["candidate"].map(lambda term: bool(excluded_pattern.search(term)))
+    excluded = pd.Series(
+        [bool(excluded_pattern.search(term)) for term in rankings["candidate"]],
+        index=rankings.index, dtype=bool,
+    )
     selected = rankings.loc[
         ~excluded & rankings["n_posts"].ge(minimum_posts) & rankings["n_threads"].ge(minimum_threads)
     ].copy().reset_index(drop=True)
@@ -64,6 +67,10 @@ def load_run(run_directory):
     tables = {}
     filenames = ["discovery_posts", "retrieval_summary", "reference_coverage", "tfidf_candidates",
                  "candidate_occurrences", "candidate_metadata", "candidate_post_scores", "ranked_candidates"]
+    filenames += [
+        name for name in ("conversation_posts", "social_evidence", "reply_reactions")
+        if (folder / f"{name}.csv").is_file()
+    ]
     for name in filenames:
         path = folder / f"{name}.csv"
         if sha256(path.read_bytes()).hexdigest() != run_info["artifact_checksums"].get(path.name):
@@ -72,6 +79,15 @@ def load_run(run_directory):
     for column in ("raw_post", "matched_seeds"):
         tables["discovery_posts"][column] = tables["discovery_posts"][column].map(json.loads)
     tables["candidate_occurrences"]["word_spans"] = tables["candidate_occurrences"]["word_spans"].map(json.loads)
+    if "conversation_posts" in tables:
+        tables["conversation_posts"]["reply_to_post_ids"] = (
+            tables["conversation_posts"]["reply_to_post_ids"].map(json.loads)
+        )
+    if "reply_reactions" in tables:
+        tables["reply_reactions"]["target_post_ids"] = (
+            tables["reply_reactions"]["target_post_ids"].map(json.loads)
+        )
+        tables["reply_reactions"]["cues"] = tables["reply_reactions"]["cues"].map(json.loads)
     stage_path = folder / "candidate_stage_counts.json"
     if sha256(stage_path.read_bytes()).hexdigest() != run_info["artifact_checksums"].get(stage_path.name):
         raise ValueError("Candidate stage counts changed since export.")

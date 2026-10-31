@@ -41,6 +41,15 @@ def parse_arguments(arguments=None):
                         help="Reproducible discovery selection for uniform_time; ignored by first_matching")
     parser.add_argument("--batch-size", type=int, default=16, help="Candidate BERT window batch size")
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--conversation-embeddings", action="store_true",
+                        help="Prepend bounded opener/explicit-parent context to candidate BERT windows")
+    parser.add_argument("--audience-uptake", action="store_true",
+                        help="Rerank using later unquoted term reuse inside selected threads")
+    parser.add_argument("--reply-reactions", action="store_true",
+                        help="Rerank using exploratory cues in explicit replies")
+    parser.add_argument("--conversation-context-tokens", type=int, default=48)
+    parser.add_argument("--uptake-weight", type=float, default=0.10)
+    parser.add_argument("--reaction-weight", type=float, default=0.05)
     parsed = parser.parse_args(arguments)
     if parsed.reference_bank is None:
         parsed.reference_bank = PROJECT_ROOT / "artifacts/reference_banks" / f"{parsed.category}_v1"
@@ -90,6 +99,8 @@ def run_experiment(arguments):
     from utils.reference_bank import load_reference_bank, validate_discovery_bank
     from utils.reference_review import file_sha256
     from utils.scoring import score_fixed_reference_bank, summarize_rankings
+    from utils.conversation import (attach_conversation_context, load_selected_threads,
+                                    rerank_with_social_evidence, social_evidence)
 
     category = arguments.category
     anchors, seed_words = vocabulary_for_category(category)
@@ -97,6 +108,12 @@ def run_experiment(arguments):
     validate_discovery_sampling(arguments.sampling_method, arguments.sampling_random_seed)
     if arguments.max_posts < 1 or arguments.batch_size < 1:
         raise ValueError("--max-posts and --batch-size must be positive.")
+    if type(arguments.conversation_context_tokens) is not int or not 0 <= arguments.conversation_context_tokens <= 256:
+        raise ValueError("--conversation-context-tokens must be an integer from 0 to 256.")
+    if arguments.conversation_embeddings and arguments.conversation_context_tokens == 0:
+        raise ValueError("Conversation embeddings need at least one context token.")
+    if not 0 <= arguments.uptake_weight <= 1 or not 0 <= arguments.reaction_weight <= 1:
+        raise ValueError("Social weights must be between zero and one.")
     if arguments.output.exists():
         raise FileExistsError(f"Run directory already exists: {arguments.output}. Choose a new --output.")
     if not (arguments.reference_bank / "bank_manifest.json").is_file():
@@ -129,6 +146,13 @@ def run_experiment(arguments):
     )
     stage_times["retrieval"] = perf_counter() - stage_started
     print(f"Retrieved {len(posts):,} posts in {posts.thread_id.nunique():,} threads.", flush=True)
+    thread_posts = None
+    if arguments.conversation_embeddings or arguments.audience_uptake or arguments.reply_reactions:
+        print("Loading surrounding posts from the selected threads", flush=True)
+        stage_started = perf_counter()
+        thread_posts = load_selected_threads(arguments.input, posts, reference_posts)
+        posts = attach_conversation_context(posts, thread_posts)
+        stage_times["conversation_lookup"] = perf_counter() - stage_started
 
     print("3/5: Existing lexical/POS/TF-IDF candidate extraction", flush=True)
     stage_started = perf_counter()
@@ -156,6 +180,7 @@ def run_experiment(arguments):
     ) = embed_candidates(
         occurrences, posts.rename(columns={"text": "Text for BERT"}), arguments.batch_size,
         model, tokenizer, device, embedding_configuration["context_tokens_each_side"],
+        arguments.conversation_context_tokens if arguments.conversation_embeddings else 0,
     )
     occurrence_metadata = enrich_candidate_metadata(occurrence_metadata, posts)
     candidate_metadata = enrich_candidate_metadata(candidate_metadata, posts)
@@ -166,6 +191,13 @@ def run_experiment(arguments):
     stage_started = perf_counter()
     candidate_post_scores = score_fixed_reference_bank(candidate_vectors, candidate_metadata, reference_vectors, reference_metadata)
     rankings, relevance_threshold = summarize_rankings(candidate_post_scores, occurrence_metadata)
+    social_summary, reaction_examples = None, None
+    if arguments.audience_uptake or arguments.reply_reactions:
+        social_summary, reaction_examples = social_evidence(rankings, thread_posts)
+        rankings = rerank_with_social_evidence(
+            rankings, social_summary, arguments.audience_uptake, arguments.reply_reactions,
+            arguments.uptake_weight, arguments.reaction_weight,
+        )
     stage_times["scoring"] = perf_counter() - stage_started
     stage_counts["candidate_post_embeddings"] = len(candidate_metadata)
     stage_counts["ranked_candidates"] = len(rankings)
@@ -177,7 +209,21 @@ def run_experiment(arguments):
         "requested_max_posts": arguments.max_posts, "retrieval": retrieval_info,
         "reference_bank": {"path": str(arguments.reference_bank), "identifier_sha256": bank_identifier,
                            "manifest": bank_manifest},
-        "embedding_config": embedding_configuration, "candidate_embedding_procedure": EMBEDDING_PROCEDURE,
+        "embedding_config": embedding_configuration,
+        "candidate_embedding_procedure": EMBEDDING_PROCEDURE + (
+            "+thread-prefix-v1" if arguments.conversation_embeddings else ""),
+        "conversation": {
+            "embedding_enabled": arguments.conversation_embeddings,
+            "audience_uptake_enabled": arguments.audience_uptake,
+            "reply_reactions_enabled": arguments.reply_reactions,
+            "context_tokens": arguments.conversation_context_tokens,
+            "uptake_weight": arguments.uptake_weight,
+            "reaction_weight": arguments.reaction_weight,
+            "uptake_measure": "Unquoted exact-phrase posts after the first observed use within each selected thread",
+            "reaction_measure": "Direct >>post replies with moderation or laughter cues; pushback saved separately",
+            "experimental_score": "HMApp relevance + uptake_weight * normalized log1p(reuse_posts) "
+                                  "+ reaction_weight * normalized log1p(cued_direct_replies)",
+        },
         "candidate_batch_size": arguments.batch_size, "device": str(device), "random_seed": random_seed,
         "tfidf_threshold": stage_counts["tfidf_threshold"], "relevance_threshold": relevance_threshold,
         "nearest_reference_vectors": 5, "ngram_policy": stage_counts["ngram_policy"],
@@ -198,11 +244,17 @@ def run_experiment(arguments):
             "Existing noun/adjective POS rules are provisional, not verified exact Wu rules",
             "Reference preparation selects one occurrence per anchor/thread and caps contexts; candidate repeats are averaged",
             "Distinct posts/threads do not establish independent adoption; similarity is not a hate label",
+            "Conversation search covers selected seed-matching threads, not the entire corpus",
+            "Reply links are explicit >>post references; missing links do not imply no response",
+            "Reaction keywords are exploratory cues, not validated stance or hate labels",
+            "Conversation-conditioned candidates use the frozen post-only reference bank",
         ],
     }
     save_discovery_run(arguments.output, run_info, posts, seed_summary, reference_coverage,
                        stage_counts, tfidf_candidates, occurrence_metadata, candidate_vectors,
-                       candidate_metadata, candidate_post_scores, rankings)
+                       candidate_metadata, candidate_post_scores, rankings,
+                       conversation_posts=thread_posts, social_summary=social_summary,
+                       reaction_examples=reaction_examples)
     print(f"Completed run: {arguments.output}", flush=True)
     return arguments.output
 

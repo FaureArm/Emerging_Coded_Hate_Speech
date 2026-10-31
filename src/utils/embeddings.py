@@ -198,14 +198,15 @@ def average_candidate_tokens(
     token_offsets,
     word_spans,
     window_start,
+    prefix_length=0,
 ):
     """Average the candidate's subword vectors within one context window."""
     selected_tokens = torch.zeros(len(token_offsets), dtype=torch.bool)
 
     for word_start, word_end in word_spans:
         # Convert original post positions into positions within this window.
-        relative_start = word_start - window_start
-        relative_end = word_end - window_start
+        relative_start = word_start - window_start + prefix_length
+        relative_end = word_end - window_start + prefix_length
 
         overlaps_word = (token_offsets[:, 1] > relative_start) & (
             token_offsets[:, 0] < relative_end
@@ -226,12 +227,12 @@ def average_candidate_tokens(
     return vector.cpu().numpy()
 
 
-def embed_window_batch(post_text, window_batch, model, tokenizer, device):
+def embed_window_batch(post_text, window_batch, model, tokenizer, device, prefix=""):
     """Run BERT on several windows and extract their candidate vectors."""
     passages = []
 
     for window in window_batch:
-        passages.append(post_text[window["start"] : window["end"]])
+        passages.append(prefix + post_text[window["start"] : window["end"]])
 
     inputs = tokenizer(
         passages,
@@ -262,15 +263,33 @@ def embed_window_batch(post_text, window_batch, model, tokenizer, device):
                     offsets[window_index],
                     word_spans,
                     window["start"],
+                    len(prefix),
                 )
 
     return occurrence_vectors
 
 
+def bounded_conversation_prefix(conversation_context, tokenizer, maximum_tokens):
+    if not conversation_context or maximum_tokens == 0:
+        return ""
+    encoded = tokenizer(conversation_context, add_special_tokens=False,
+                        return_offsets_mapping=True, verbose=False)
+    offsets = encoded["offset_mapping"]
+    if not offsets:
+        return ""
+    first_offset = offsets[max(0, len(offsets) - maximum_tokens)][0]
+    return "[CONTEXT] " + conversation_context[first_offset:] + "\n[TARGET] "
+
+
 def embed_candidates(candidate_occurrences, embedding_posts, candidate_batch_size,
-                     model, tokenizer, device, context_tokens):
+                     model, tokenizer, device, context_tokens,
+                     conversation_context_tokens=0):
     if type(candidate_batch_size) is not int or candidate_batch_size < 1:
         raise ValueError("candidate_batch_size must be a positive integer.")
+    if type(conversation_context_tokens) is not int or conversation_context_tokens < 0:
+        raise ValueError("conversation_context_tokens must be a nonnegative integer.")
+    if conversation_context_tokens and "conversation_context" not in embedding_posts:
+        raise ValueError("Conversation context was enabled but is missing from discovery posts.")
     # 1. Prepare one metadata row and one vector slot per occurrence.
     candidate_occurrence_metadata = candidate_occurrences.drop_duplicates(
         ["post_id", "candidate", "word_spans"]
@@ -289,11 +308,15 @@ def embed_candidates(candidate_occurrences, embedding_posts, candidate_batch_siz
 
     for post_id, post_occurrences in tqdm(posts, desc="Embedding candidate posts"):
         post_text = embedding_posts.loc[post_id, "Text for BERT"]
+        prefix = bounded_conversation_prefix(
+            embedding_posts.loc[post_id, "conversation_context"], tokenizer,
+            conversation_context_tokens,
+        ) if conversation_context_tokens else ""
         windows = prepare_context_windows(post_text, post_occurrences, tokenizer, context_tokens)
 
         for batch_start in range(0, len(windows), candidate_batch_size):
             window_batch = windows[batch_start : batch_start + candidate_batch_size]
-            batch_vectors = embed_window_batch(post_text, window_batch, model, tokenizer, device)
+            batch_vectors = embed_window_batch(post_text, window_batch, model, tokenizer, device, prefix)
 
             for occurrence_id, vector in batch_vectors.items():
                 candidate_occurrence_embeddings[occurrence_id] = vector

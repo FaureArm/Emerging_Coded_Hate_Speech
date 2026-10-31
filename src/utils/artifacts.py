@@ -3,7 +3,8 @@ import numpy as np
 
 def save_discovery_run(output_dir, run_info, posts, seed_summary, reference_coverage,
                        stage_counts, tfidf_candidates, occurrences, embeddings,
-                       metadata, post_scores, rankings):
+                       metadata, post_scores, rankings, conversation_posts=None,
+                       social_summary=None, reaction_examples=None):
     """Save one complete run. run_info.json is written last as the completion marker."""
     import json
     from pathlib import Path
@@ -31,6 +32,14 @@ def save_discovery_run(output_dir, run_info, posts, seed_summary, reference_cove
         "candidate_post_scores.csv": post_scores,
         "ranked_candidates.csv": rankings,
     }
+    if conversation_posts is not None:
+        exported_conversation = conversation_posts.copy()
+        exported_conversation["reply_to_post_ids"] = exported_conversation["reply_to_post_ids"].map(json.dumps)
+        tables["conversation_posts.csv"] = exported_conversation
+    if social_summary is not None:
+        tables["social_evidence.csv"] = social_summary
+    if reaction_examples is not None:
+        tables["reply_reactions.csv"] = reaction_examples
     for filename, table in tables.items():
         table.to_csv(output_dir / filename, index=False)
     np.save(output_dir / "candidate_embeddings.npy", embeddings, allow_pickle=False)

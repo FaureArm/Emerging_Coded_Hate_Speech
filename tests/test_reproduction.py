@@ -23,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 import run_reproduction
 from utils import discovery, embeddings
+from utils.conversation import (attach_conversation_context, load_selected_threads,
+                                rerank_with_social_evidence, social_evidence)
 from utils.candidates import build_ngrams, build_pos_ngrams, apply_pos_filter, find_candidate_occurrences
 from utils.discovery import retrieve_discovery_posts, normalized_text_hash
 from utils.preprocessing import cleanup, tokenize_with_positions
@@ -320,6 +322,88 @@ class ReproductionTests(unittest.TestCase):
         np.testing.assert_array_equal(embeddings.average_candidate_tokens(
             token_vectors, offsets, [(0, 5), (12, 17)], 0), [4., 4.])
 
+    def test_conversation_context_and_social_signals(self):
+        source = self.directory / "conversation.ndjson"
+        write_records(source, [make_record(900, [
+            "A blue lantern is our new phrase.",
+            "&gt;&gt;900 Jewish blue lantern in this reply.",
+            "&gt;&gt;901 blue lantern lol, moderators banned it.",
+            "&gt;&gt;901 blue lantern appears again.",
+            "&gt;&gt;901<br>&gt;blue lantern quoted<br>no fresh use here.",
+            "&gt;&gt;901 that sounds racist.",
+        ])])
+        selected, _, _ = retrieve_discovery_posts(source, ["Jewish"], self.reference_posts, 1)
+        thread_posts = load_selected_threads(source, selected, self.reference_posts)
+        self.assertEqual(len(thread_posts), 6)
+        self.assertEqual(thread_posts.set_index("post_id").loc[902, "reply_to_post_ids"], [901])
+        with_context = attach_conversation_context(selected, thread_posts)
+        self.assertEqual(with_context.loc[901, "conversation_parent_id"], 900)
+        self.assertIn("A blue lantern is our new phrase", with_context.loc[901, "conversation_context"])
+        rankings = pd.DataFrame({"candidate": ["blue lantern", "unrelated"],
+                                 "relevance": [0.6, 0.65], "original_rank": [2, 1]})
+        evidence, replies = social_evidence(rankings, thread_posts)
+        blue = evidence.set_index("candidate").loc["blue lantern"]
+        self.assertEqual((blue.observed_thread_posts, blue.reuse_posts), (4, 3))
+        self.assertEqual((blue.direct_replies, blue.cued_direct_replies, blue.pushback_replies), (5, 1, 1))
+        self.assertEqual(replies.iloc[0]["reply_post_id"], 902)
+        ranked = rerank_with_social_evidence(rankings, evidence, True, True, 0.10, 0.05)
+        self.assertEqual(ranked.set_index("candidate").loc["blue lantern", "experimental_rank"], 1)
+        self.assertEqual(ranked.set_index("candidate").loc["unrelated", "original_rank"], 1)
+        baseline = rerank_with_social_evidence(rankings, evidence, False, False, 0.10, 0.05)
+        np.testing.assert_array_equal(baseline.experimental_score, baseline.relevance)
+
+    def test_candidate_embedding_uses_parent_context_without_shifting_target(self):
+        model, tokenizer, device = TinyModel(), TinyTokenizer(), torch.device("cpu")
+        text = "blue lantern"
+        occurrences = pd.DataFrame([{
+            "post_id": 901, "candidate": "blue lantern", "matched_text": text,
+            "start": 0, "end": len(text), "word_spans": ((0, 4), (5, 12)),
+            "is_contiguous": True,
+        }])
+        posts = pd.DataFrame({"Text for BERT": [text],
+                              "conversation_context": ["The opener explains the phrase."]}, index=[901])
+        _, _, _, _, baseline_vectors, _ = embeddings.embed_candidates(
+            occurrences, posts, 2, model, tokenizer, device, 16)
+        _, _, _, _, contextual_vectors, _ = embeddings.embed_candidates(
+            occurrences, posts, 2, model, tokenizer, device, 16, 16)
+        self.assertFalse(np.array_equal(baseline_vectors, contextual_vectors))
+        self.assertEqual(baseline_vectors.shape, contextual_vectors.shape)
+
+    def test_full_conversation_run_exports_optional_artifacts(self):
+        source = self.directory / "conversation_run.ndjson"
+        write_records(source, [
+            make_record(900, [
+                "The opener introduces blue lantern.",
+                "&gt;&gt;900 Jewish blue lantern appears here.",
+                "&gt;&gt;901 blue lantern lol moderators.",
+            ]),
+            make_record(1000, [
+                "Another opener discusses silver garden.",
+                "&gt;&gt;1000 Jewish silver garden appears here.",
+                "&gt;&gt;1001 silver garden again.",
+            ]),
+        ])
+        arguments = run_reproduction.parse_arguments([
+            "--category", "antisemitism", "--input", str(source),
+            "--reference-bank", str(self.bank), "--output", str(self.directory / "conversation_run"),
+            "--max-posts", "2", "--device", "cpu",
+            "--conversation-embeddings", "--audience-uptake", "--reply-reactions",
+        ])
+        with patch("utils.preprocessing.load_nlp_tools", return_value=(
+                {"the", "here"}, PunktSentenceTokenizer(), NLTKWordTokenizer())), \
+             patch("nltk.pos_tag", side_effect=lambda words: [(word, "NN") for word in words]), \
+             patch("utils.embeddings.load_embedding_model",
+                   return_value=(TinyModel(), TinyTokenizer(), torch.device("cpu"))), \
+             redirect_stdout(StringIO()):
+            run_reproduction.run_experiment(arguments)
+        info, tables, _ = load_run(arguments.output)
+        self.assertTrue(info["conversation"]["embedding_enabled"])
+        self.assertIn("conversation_posts", tables)
+        self.assertIn("social_evidence", tables)
+        self.assertIn("reply_reactions", tables)
+        self.assertIn("experimental_rank", tables["ranked_candidates"])
+        self.assertEqual(len(tables["conversation_posts"]), 6)
+
     def test_top_five_scoring_and_guards(self):
         candidate_vectors = np.random.default_rng(2).normal(size=(3, 4)).astype(np.float32)
         metadata = pd.DataFrame({"candidate": ["sample", "sample", "other"], "post_id": [900, 901, 902],
@@ -384,7 +468,10 @@ class ReproductionTests(unittest.TestCase):
         output = self.directory / "run"
         arguments = SimpleNamespace(category="antisemitism", input=source, reference_bank=self.bank, output=output,
                                     max_posts=4, batch_size=16, device="cpu",
-                                    sampling_method="first_matching", sampling_random_seed=42)
+                                    sampling_method="first_matching", sampling_random_seed=42,
+                                    conversation_embeddings=False, audience_uptake=False,
+                                    reply_reactions=False, conversation_context_tokens=48,
+                                    uptake_weight=0.10, reaction_weight=0.05)
         bank_checksums = {path.name: sha256(path.read_bytes()).hexdigest() for path in self.bank.iterdir()}
         with patch("utils.preprocessing.load_nlp_tools", return_value=({"after", "the", "and"}, PunktSentenceTokenizer(), NLTKWordTokenizer())), \
              patch("nltk.pos_tag", side_effect=lambda words: [(word, "NN") for word in words]), \
@@ -422,6 +509,8 @@ for cell in notebook['cells']:
         source = '\\n'.join(
             'RUN_DIRECTORY = Path(' + repr(RUN_PATH) + ')' if line.startswith('RUN_DIRECTORY = ') else line
             for line in source.split('\\n'))
+        # Plotly's interactive show may launch a browser outside a notebook.
+        source = source.replace('figure.show()', 'pass')
         exec(compile(source, cell['id'], 'exec'), namespace)
 print('OFFLINE_NOTEBOOK_OK')
 '''

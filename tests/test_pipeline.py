@@ -158,6 +158,17 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "settings differ"):
                 pipeline.run_pipeline()
 
+    def test_conversation_switches_reach_remote_worker(self):
+        with patch.multiple(pipeline, USE_CONVERSATION_EMBEDDINGS=True,
+                            USE_AUDIENCE_UPTAKE=True, USE_REPLY_REACTIONS=True):
+            output = pipeline.run_pipeline()
+            info, tables, _ = load_run(output)
+        self.assertTrue(info["conversation"]["embedding_enabled"])
+        self.assertTrue(info["conversation"]["audience_uptake_enabled"])
+        self.assertTrue(info["conversation"]["reply_reactions_enabled"])
+        self.assertIn("conversation_posts", tables)
+        self.assertIn("experimental_rank", tables["ranked_candidates"])
+
     def test_uniform_time_setting_reaches_worker_and_reuses_existing_bank(self):
         pipeline.run_pipeline()
         bank_manifest = self.project / "artifacts/reference_banks/antisemitism_test/bank_manifest.json"
