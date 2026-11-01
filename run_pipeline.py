@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from utils.vocabulary import HATE_CATEGORIES, vocabulary_for_category
 
 # --------------------------- EDIT SETTINGS HERE ---------------------------
-HATE_CATEGORY = "islamophobia"  # Or pass --category; seeds and anchors come from vocabulary.py.
+HATE_CATEGORY = "antisemitism"  # Or pass --category; seeds and anchors come from vocabulary.py.
 # False: use the existing input files below (including a shared file).
 # True: create/reuse separate consecutive slices locally before the Colab run.
 PREPARE_SLICES_FROM_ARCHIVE = False
@@ -43,15 +43,15 @@ DISCOVERY_SOURCE = "data/raiders/raiders_10GB.ndjson"
 
 # None uses <category>_v1. Use a new name when reference/model settings change.
 # The old islamophobia_v3 bank contains antisemitism anchors; do not reuse it.
-REFERENCE_VERSION = None
+REFERENCE_VERSION = "antisemitism_v4"
 MAX_REFERENCES_PER_ANCHOR = 100  # None keeps all eligible distinct contexts.
 REFERENCE_RANDOM_SEED = 42
 
 MAX_DISCOVERY_POSTS = 10000
-DISCOVERY_SAMPLING_METHOD = "first_matching"  # Or "uniform_time": balance eligible posts across UTC days.
+DISCOVERY_SAMPLING_METHOD = "uniform_time"  # "first_matching" Or "uniform_time": balance eligible posts across UTC days.
 DISCOVERY_RANDOM_SEED = 42  # Used only by uniform_time; independent of reference selection.
 CANDIDATE_BATCH_SIZE = 16
-RUN_NAME = None  # None creates a unique timestamped name; otherwise use a new name.
+RUN_NAME = "Uniform_time_1"  # None creates a unique timestamped name; otherwise use a new name.
 
 BERT_CHECKPOINT = "google-bert/bert-base-uncased"
 MODEL_REVISION = "86b5e0934494bd15c9632b12f734a8a67f723594"  # Same revision as your first run.
